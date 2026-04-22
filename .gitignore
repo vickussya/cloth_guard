@@ -3,6 +3,8 @@
 # Build artifacts
 dist/
 build/
+_stage/
+*.zip
 
 # Python
 __pycache__/

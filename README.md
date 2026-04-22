@@ -35,25 +35,16 @@ Rigged garments often look good in a rest pose but clip into the character durin
 
 ## Installation
 
-### Recommended (release zip)
+### Install as a ZIP
 
-Install the **release zip** named `cloth_guard.zip` (it contains exactly one top-level folder: `cloth_guard/`).
+1. Create a zip that contains a single top-level folder named `cloth_guard/` with `cloth_guard/__init__.py` inside.
+2. In Blender: `Edit` -> `Preferences` -> `Add-ons` -> `Install...`
+3. Select the zip, then enable **Cloth Guard**.
 
-1. In Blender: `Edit` -> `Preferences` -> `Add-ons` -> `Install...`
-2. Select `cloth_guard.zip`, then enable **Cloth Guard**.
+### Install by copying the folder
 
-### Installing from GitHub
-
-GitHub's **Download ZIP** wraps the repository in an extra top-level folder (for example `cloth_guard-main/`). Blender may not detect the add-on correctly from that archive.
-
-Use the packaging script to build a Blender-installable zip:
-
-1. Run `python build_addon.py`
-2. Install the generated `dist/cloth_guard.zip` in Blender via `Edit` -> `Preferences` -> `Add-ons` -> `Install...`
-
-If you don't have a system `python`, you can run the script with Blender's bundled Python (path varies by installation), or run it via Blender:
-
-- `blender --background --python build_addon.py --`
+1. Copy the `cloth_guard/` folder into your Blender add-ons directory.
+2. Enable **Cloth Guard** in `Edit` -> `Preferences` -> `Add-ons`.
 
 ## Quick start workflow
 
@@ -106,4 +97,3 @@ This project is licensed under the **GNU General Public License v3.0 (GPL-3.0)**
 ## Author
 
 - **Vickussya**
-
