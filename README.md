@@ -28,32 +28,37 @@ Rigged garments often look good in a rest pose but clip into the character durin
 
 - **Blender 3.0+** (minimum)
 
+## Repository layout (source vs install zip)
+
+- **Source repository**: add-on code lives in `cloth_guard/` for development.
+- **Install zip**: Blender expects a zip containing exactly one top-level add-on folder named `cloth_guard/` with an `__init__.py` inside.
+
 ## Installation
 
 ### Recommended (release zip)
 
 Install the **release zip** named `cloth_guard.zip` (it contains exactly one top-level folder: `cloth_guard/`).
 
-1. In Blender: `Edit` → `Preferences` → `Add-ons` → `Install...`
+1. In Blender: `Edit` -> `Preferences` -> `Add-ons` -> `Install...`
 2. Select `cloth_guard.zip`, then enable **Cloth Guard**.
 
 ### Installing from GitHub
 
-GitHub’s **Download ZIP** wraps the repository in an extra top-level folder (for example `cloth_guard-main/`). Blender may not detect the add-on correctly from that archive.
+GitHub's **Download ZIP** wraps the repository in an extra top-level folder (for example `cloth_guard-main/`). Blender may not detect the add-on correctly from that archive.
 
 Use the packaging script to build a Blender-installable zip:
 
 1. Run `python build_addon.py`
-2. Install the generated `dist/cloth_guard.zip` in Blender via `Edit` → `Preferences` → `Add-ons` → `Install...`
+2. Install the generated `dist/cloth_guard.zip` in Blender via `Edit` -> `Preferences` -> `Add-ons` -> `Install...`
 
-If you don’t have a system `python`, you can run the script with Blender’s bundled Python (path varies by installation), or run it via Blender:
+If you don't have a system `python`, you can run the script with Blender's bundled Python (path varies by installation), or run it via Blender:
 
 - `blender --background --python build_addon.py --`
 
 ## Quick start workflow
 
 1. Select your **Body** and **Garment** mesh objects.
-2. Open the 3D Viewport sidebar: `N` → **Cloth Guard** tab.
+2. Open the 3D Viewport sidebar: `N` -> **Cloth Guard** tab.
 3. Assign **Body Object** and **Garment Object**.
 4. Click **Setup Cloth Guard**.
 5. Click **Create Body Mask** to hide body parts under the garment.
@@ -63,21 +68,21 @@ If you don’t have a system `python`, you can run the script with Blender’s b
 
 ## Body masking (what it does)
 
-Body masking helps reduce visible “body poking through cloth” by hiding body geometry that is sufficiently close to the garment. Cloth Guard:
+Body masking helps reduce visible "body poking through cloth" by hiding body geometry that is sufficiently close to the garment. Cloth Guard:
 
 - Creates/updates a body vertex group (`CG_BodyMask`)
 - Creates/updates a **Mask** modifier on the body and **inverts** it so the vertex group represents hidden regions
 
-This is a visibility/cleanup workflow — it does not physically push the cloth away, but it often removes the most distracting clipping artifacts.
+This is a visibility/cleanup workflow - it does not physically push the cloth away, but it often removes the most distracting clipping artifacts.
 
 ## Current-pose correction (what it does)
 
-Cloth Guard’s MVP anti-clip correction is intentionally **non-simulation**:
+Cloth Guard's MVP anti-clip correction is intentionally **non-simulation**:
 
 - It computes a proximity-based weight map (`CG_Clipping`) using closest-surface distance to the body
 - A Shrinkwrap-based anti-clip modifier stack (plus optional smoothing) pushes only the weighted vertices toward the body surface and offsets them outward
 
-This aims for **small, predictable fixes** rather than aggressive “perfect collisions”.
+This aims for **small, predictable fixes** rather than aggressive "perfect collisions".
 
 ## Corrective shape keys (what they do)
 
@@ -101,3 +106,4 @@ This project is licensed under the **GNU General Public License v3.0 (GPL-3.0)**
 ## Author
 
 - **Vickussya**
+

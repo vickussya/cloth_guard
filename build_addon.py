@@ -1,17 +1,17 @@
 """
 Cloth Guard add-on packager.
 
-Creates an installable Blender add-on zip with this structure:
+GitHub "Download ZIP" wraps the repo in an extra folder (often with a dash),
+which Blender may not load as an add-on package folder name. This script builds
+a clean Blender-installable archive with a single top-level add-on folder:
 
 cloth_guard.zip
   cloth_guard/
     __init__.py
     operators.py
-    panel.py
+    panels.py
     properties.py
     utils.py
-
-This avoids the extra top-level folder GitHub adds to "Download ZIP".
 """
 
 from __future__ import annotations
@@ -22,9 +22,11 @@ import zipfile
 from pathlib import Path
 
 
-ADDON_DIR_NAME = "cloth_guard"
 DEFAULT_DIST_DIR = "dist"
 DEFAULT_ZIP_NAME = "cloth_guard.zip"
+
+ADDON_FOLDER_IN_ZIP = "cloth_guard"
+ADDON_PACKAGE_DIR = "cloth_guard"
 
 
 def _is_ignored_path(path: Path) -> bool:
@@ -37,7 +39,7 @@ def _is_ignored_path(path: Path) -> bool:
 
 
 def build_zip(*, repo_root: Path, output_zip: Path) -> None:
-    addon_dir = repo_root / ADDON_DIR_NAME
+    addon_dir = repo_root / ADDON_PACKAGE_DIR
     if not addon_dir.is_dir():
         raise SystemExit(f"Missing add-on folder: {addon_dir}")
     if not (addon_dir / "__init__.py").is_file():
@@ -53,7 +55,6 @@ def build_zip(*, repo_root: Path, output_zip: Path) -> None:
                 continue
             if _is_ignored_path(path):
                 continue
-            # Keep paths inside the zip rooted at `cloth_guard/`.
             arcname = path.relative_to(repo_root).as_posix()
             zf.write(path, arcname)
 
@@ -88,4 +89,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

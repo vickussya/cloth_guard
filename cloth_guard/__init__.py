@@ -19,7 +19,7 @@ bl_info = {
     "author": "Vickussya",
     "version": (0, 1, 0),
     "blender": (3, 0, 0),
-    "location": "View3D > Sidebar > Cloth Guard",
+    "location": "3D View > Sidebar > Cloth Guard",
     "description": "Non-simulation clothing anti-clipping and shape-preservation tools for animation",
     "category": "Animation",
 }
@@ -36,7 +36,7 @@ from .operators import (
     CG_OT_remove_setup,
     CG_OT_setup,
 )
-from .panel import CG_PT_main
+from .panels import CG_PT_main
 from .properties import CG_Settings, register_properties, unregister_properties
 
 

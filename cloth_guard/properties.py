@@ -212,4 +212,3 @@ def unregister_properties():
         del bpy.types.Scene.cg_settings
     except Exception:
         pass
-

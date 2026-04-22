@@ -87,4 +87,3 @@ class CG_PT_main(Panel):
         col.separator()
         col.prop(settings, "use_risk_area")
         col.prop(settings, "preserve_pinned_areas")
-
