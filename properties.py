@@ -26,6 +26,7 @@ from bpy.props import (
     StringProperty,
 )
 from bpy.types import Object, PropertyGroup
+from bpy.types import Collection
 
 from .utils import cg_update_modifier_visibility
 
@@ -46,16 +47,23 @@ class CG_Settings(PropertyGroup):
         description="Character body mesh (used for masking and proximity checks)",
     )
 
+    garment_collection: PointerProperty(
+        name="Garment Collection",
+        type=Collection,
+        description="Collection containing garment mesh objects to process (shirts/jackets/pants/etc.)",
+    )
+
+    # Legacy single-garment support (kept for older .blend files; UI prefers garment_collection).
     garment_object: PointerProperty(
-        name="Garment Object",
+        name="Garment Object (Legacy)",
         type=Object,
         poll=_poll_mesh_object,
-        description="Rigged garment mesh (to detect clipping and apply corrections)",
+        description="Legacy single garment mesh (use Garment Collection for production workflows)",
     )
 
     enable_live_anti_clip: BoolProperty(
         name="Enable Live Anti-Clip",
-        description="Enable/disable Cloth Guard's live correction shape key on the garment (refresh as needed)",
+        description="Enable/disable Cloth Guard's live correction shape key on garments (refresh as needed)",
         default=False,
         update=lambda self, context: cg_update_modifier_visibility(context),
     )

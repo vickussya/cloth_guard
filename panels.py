@@ -32,7 +32,16 @@ class CG_PT_main(Panel):
         box = layout.box()
         box.label(text="Object Assignment")
         box.prop(settings, "body_object")
-        box.prop(settings, "garment_object")
+        box.prop(settings, "garment_collection")
+
+        if settings.garment_collection is not None:
+            garment_meshes = [o for o in settings.garment_collection.all_objects if o.type == "MESH"]
+            sub = box.column(align=True)
+            sub.label(text=f"Garments: {len(garment_meshes)} mesh object(s)")
+            for obj in garment_meshes[:10]:
+                sub.label(text=f"- {obj.name}")
+            if len(garment_meshes) > 10:
+                sub.label(text="(more...)")
 
         box = layout.box()
         box.label(text="Setup")

@@ -206,7 +206,10 @@ def detect_clipping(
         garment_to_body = body_mw.inverted_safe() @ garment_mw
 
         # BVH is built in evaluated BODY LOCAL SPACE.
-        bvh_body = BVHTree.FromMesh(body_mesh, epsilon=0.0)
+        body_mesh.calc_loop_triangles()
+        body_verts = [v.co.copy() for v in body_mesh.vertices]
+        body_tris = [tuple(lt.vertices) for lt in body_mesh.loop_triangles]
+        bvh_body = BVHTree.FromPolygons(body_verts, body_tris, all_triangles=True, epsilon=0.0)
         risk_idx = _vertex_group_index(garment_obj, CG_VG_RISK) if use_risk_area else None
 
         # When normals are noisy or inconsistent, require a small negative dot to call it penetration.
@@ -264,17 +267,18 @@ def detect_clipping(
                     debug_printed += 1
 
         # Face overlap heuristic.
+        garment_mesh.calc_loop_triangles()
         garment_verts_body = [garment_to_body @ v.co for v in garment_mesh.vertices]
-        garment_polys = [list(p.vertices) for p in garment_mesh.polygons]
-        bvh_garment_local = BVHTree.FromPolygons(garment_verts_body, garment_polys, all_triangles=False, epsilon=0.0)
+        garment_tris = [tuple(lt.vertices) for lt in garment_mesh.loop_triangles]
+        bvh_garment_local = BVHTree.FromPolygons(garment_verts_body, garment_tris, all_triangles=True, epsilon=0.0)
 
         overlaps = bvh_body.overlap(bvh_garment_local)
         if overlaps:
-            for _, g_poly_idx in overlaps:
-                g_idx = int(g_poly_idx)
-                if g_idx >= len(garment_mesh.polygons):
+            for _, g_tri_idx in overlaps:
+                g_idx = int(g_tri_idx)
+                if g_idx >= len(garment_mesh.loop_triangles):
                     continue
-                for vi in garment_mesh.polygons[g_idx].vertices:
+                for vi in garment_mesh.loop_triangles[g_idx].vertices:
                     idx = int(vi)
                     if risk_idx is not None and vertex_count_matches and _vertex_weight(base_mesh.vertices[idx], risk_idx) <= 0.0:
                         continue
@@ -345,7 +349,10 @@ def correct_current_pose(
         garment_to_body = body_mw.inverted_safe() @ garment_mw
 
         # BVH is built in evaluated BODY LOCAL SPACE.
-        bvh_body = BVHTree.FromMesh(body_mesh, epsilon=0.0)
+        body_mesh.calc_loop_triangles()
+        body_verts = [v.co.copy() for v in body_mesh.vertices]
+        body_tris = [tuple(lt.vertices) for lt in body_mesh.loop_triangles]
+        bvh_body = BVHTree.FromPolygons(body_verts, body_tris, all_triangles=True, epsilon=0.0)
 
         inv_garment_world = garment_obj.matrix_world.inverted_safe()
 
@@ -622,21 +629,35 @@ def cg_update_modifier_visibility(context) -> None:
     settings = getattr(scene, "cg_settings", None)
     if settings is None:
         return
-    garment_obj = getattr(settings, "garment_object", None)
-    if garment_obj is None or not is_mesh_object(garment_obj):
+
+    garments = []
+    coll = getattr(settings, "garment_collection", None)
+    if coll is not None:
+        for obj in coll.all_objects:
+            if is_mesh_object(obj):
+                garments.append(obj)
+    if not garments:
+        obj = getattr(settings, "garment_object", None)
+        if is_mesh_object(obj):
+            garments = [obj]
+
+    if not garments:
         return
 
     enabled = bool(settings.enable_live_anti_clip)
-    if garment_obj.data.shape_keys is not None:
-        kb = garment_obj.data.shape_keys.key_blocks.get(CG_SHAPEKEY_LIVE)
-        if kb is not None:
-            kb.value = 1.0 if enabled else 0.0
-    for mod_name in (CG_MOD_ANTICLIP, CG_MOD_SMOOTH):
-        mod = garment_obj.modifiers.get(mod_name)
-        if mod is None:
-            continue
-        mod.show_viewport = enabled
-        mod.show_render = enabled
+    for garment_obj in garments:
+        if garment_obj.data.shape_keys is not None:
+            kb = garment_obj.data.shape_keys.key_blocks.get(CG_SHAPEKEY_LIVE)
+            if kb is not None:
+                kb.value = 1.0 if enabled else 0.0
+
+        # Legacy modifier-based workflow (kept for backwards compatibility if present).
+        for mod_name in (CG_MOD_ANTICLIP, CG_MOD_SMOOTH):
+            mod = garment_obj.modifiers.get(mod_name)
+            if mod is None:
+                continue
+            mod.show_viewport = enabled
+            mod.show_render = enabled
 
 
 def add_shapekey_driver_rotation_range(

@@ -42,7 +42,7 @@ This repository is structured so the GitHub **Code -> Download ZIP** archive can
 
 1. Select your **Body** and **Garment** mesh objects.
 2. Open the 3D Viewport sidebar: `N` -> **Cloth Guard** tab.
-3. Assign **Body Object** and **Garment Object**.
+3. Assign **Body Object** and **Garment Collection** (containing your clothing meshes).
 4. Click **Setup Cloth Guard**.
 5. Click **Create Body Mask** to hide body parts under the garment.
 6. Click **Detect Clipping** to visualize problem regions in `CG_Clipping`.

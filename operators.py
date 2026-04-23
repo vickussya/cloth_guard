@@ -41,14 +41,29 @@ def _settings(context):
     return context.scene.cg_settings
 
 
+def _iter_garment_meshes_from_collection(coll):
+    if coll is None:
+        return []
+    objs = []
+    for obj in coll.all_objects:
+        if obj is not None and obj.type == "MESH":
+            objs.append(obj)
+    objs.sort(key=lambda o: o.name.lower())
+    return objs
+
+
 def _validate_assigned_meshes(settings):
     body_obj = settings.body_object
-    garment_obj = settings.garment_object
-    if body_obj is None or garment_obj is None:
+    if body_obj is None or not is_mesh_object(body_obj):
         return None
-    if not is_mesh_object(body_obj) or not is_mesh_object(garment_obj):
+
+    garments = _iter_garment_meshes_from_collection(settings.garment_collection)
+    if not garments and settings.garment_object is not None and is_mesh_object(settings.garment_object):
+        garments = [settings.garment_object]
+
+    if not garments:
         return None
-    return body_obj, garment_obj
+    return body_obj, garments
 
 
 class CG_OT_setup(Operator):
@@ -62,38 +77,42 @@ class CG_OT_setup(Operator):
         settings = getattr(context.scene, "cg_settings", None)
         if settings is None:
             return False
-        return settings.body_object is not None and settings.garment_object is not None
+        return settings.body_object is not None and (
+            settings.garment_collection is not None or settings.garment_object is not None
+        )
 
     def execute(self, context):
         settings = _settings(context)
         validated = _validate_assigned_meshes(settings)
         if validated is None:
-            self.report({"ERROR"}, "Assign valid Body and Garment mesh objects first")
+            self.report({"ERROR"}, "Assign a valid Body mesh and a Garment Collection (or legacy Garment Object) first")
             return {"CANCELLED"}
-        body_obj, garment_obj = validated
+        body_obj, garments = validated
 
         ensure_vertex_group(body_obj, CG_VG_BODY_MASK)
-        ensure_vertex_group(garment_obj, CG_VG_CLIPPING)
+        for garment_obj in garments:
+            ensure_vertex_group(garment_obj, CG_VG_CLIPPING)
 
-        # Optional control groups (only create if missing; safe defaults).
-        for name in (
-            "CG_RiskArea",
-            "CG_Pinned",
-            "CG_Preserve_Collar",
-            "CG_Preserve_Hem",
-            "CG_Preserve_Seams",
-        ):
-            if garment_obj.vertex_groups.get(name) is None:
-                garment_obj.vertex_groups.new(name=name)
+            # Optional control groups (only create if missing; safe defaults).
+            for name in (
+                "CG_RiskArea",
+                "CG_Pinned",
+                "CG_Preserve_Collar",
+                "CG_Preserve_Hem",
+                "CG_Preserve_Seams",
+            ):
+                if garment_obj.vertex_groups.get(name) is None:
+                    garment_obj.vertex_groups.new(name=name)
 
         ensure_body_mask_modifier(body_obj)
-        ensure_live_correction_shapekey(garment_obj)
-        if garment_obj.data.shape_keys is not None:
-            kb = garment_obj.data.shape_keys.key_blocks.get(CG_SHAPEKEY_LIVE)
-            if kb is not None:
-                kb.value = 1.0 if settings.enable_live_anti_clip else 0.0
+        for garment_obj in garments:
+            ensure_live_correction_shapekey(garment_obj)
+            if garment_obj.data.shape_keys is not None:
+                kb = garment_obj.data.shape_keys.key_blocks.get(CG_SHAPEKEY_LIVE)
+                if kb is not None:
+                    kb.value = 1.0 if settings.enable_live_anti_clip else 0.0
 
-        self.report({"INFO"}, "Cloth Guard setup complete")
+        self.report({"INFO"}, f"Cloth Guard setup complete ({len(garments)} garment(s))")
         return {"FINISHED"}
 
 
@@ -107,9 +126,9 @@ class CG_OT_remove_setup(Operator):
         settings = _settings(context)
         validated = _validate_assigned_meshes(settings)
         if validated is None:
-            self.report({"ERROR"}, "Assign valid Body and Garment mesh objects first")
+            self.report({"ERROR"}, "Assign a valid Body mesh and a Garment Collection (or legacy Garment Object) first")
             return {"CANCELLED"}
-        body_obj, garment_obj = validated
+        body_obj, garments = validated
 
         mod = body_obj.modifiers.get(CG_MOD_BODY_MASK)
         if mod is not None:
@@ -118,14 +137,15 @@ class CG_OT_remove_setup(Operator):
         if vg is not None:
             body_obj.vertex_groups.remove(vg)
 
-        vg = garment_obj.vertex_groups.get(CG_VG_CLIPPING)
-        if vg is not None:
-            garment_obj.vertex_groups.remove(vg)
+        for garment_obj in garments:
+            vg = garment_obj.vertex_groups.get(CG_VG_CLIPPING)
+            if vg is not None:
+                garment_obj.vertex_groups.remove(vg)
 
-        if garment_obj.data.shape_keys is not None:
-            kb = garment_obj.data.shape_keys.key_blocks.get(CG_SHAPEKEY_LIVE)
-            if kb is not None:
-                garment_obj.shape_key_remove(kb)
+            if garment_obj.data.shape_keys is not None:
+                kb = garment_obj.data.shape_keys.key_blocks.get(CG_SHAPEKEY_LIVE)
+                if kb is not None:
+                    garment_obj.shape_key_remove(kb)
 
         self.report({"INFO"}, "Cloth Guard setup removed")
         return {"FINISHED"}
@@ -141,12 +161,11 @@ class CG_OT_create_body_mask(Operator):
         settings = _settings(context)
         validated = _validate_assigned_meshes(settings)
         if validated is None:
-            self.report({"ERROR"}, "Assign valid Body and Garment mesh objects first")
+            self.report({"ERROR"}, "Assign a valid Body mesh and a Garment Collection (or legacy Garment Object) first")
             return {"CANCELLED"}
-        body_obj, garment_obj = validated
+        body_obj, garments = validated
 
         depsgraph = context.evaluated_depsgraph_get()
-        garment_eval = garment_obj.evaluated_get(depsgraph)
         body_eval = body_obj.evaluated_get(depsgraph)
 
         mask_dist = max(0.0, float(settings.mask_distance + settings.mask_expand))
@@ -154,18 +173,51 @@ class CG_OT_create_body_mask(Operator):
             self.report({"ERROR"}, "Mask distance must be > 0")
             return {"CANCELLED"}
 
-        bvh_garment = build_bvh(garment_eval, depsgraph)
-
-        vg = ensure_vertex_group(body_obj, CG_VG_BODY_MASK)
-        clear_vertex_group(body_obj, vg)
+        # Build a combined garment BVH in BODY LOCAL SPACE for stable queries.
+        from mathutils.bvhtree import BVHTree
 
         body_mesh = body_eval.to_mesh()
         try:
+            body_mesh.calc_loop_triangles()
+            body_mw = body_eval.matrix_world
+            body_mw_inv = body_mw.inverted_safe()
+
+            combined_verts = []
+            combined_tris = []
+            vert_offset = 0
+
+            for garment_obj in garments:
+                garment_eval = garment_obj.evaluated_get(depsgraph)
+                g_mesh = garment_eval.to_mesh()
+                try:
+                    g_mesh.calc_loop_triangles()
+                    garment_to_body = body_mw_inv @ garment_eval.matrix_world
+
+                    g_verts = [garment_to_body @ v.co for v in g_mesh.vertices]
+                    g_tris = [tuple(vert_offset + vi for vi in lt.vertices) for lt in g_mesh.loop_triangles]
+
+                    combined_verts.extend(g_verts)
+                    combined_tris.extend(g_tris)
+                    vert_offset += len(g_verts)
+                finally:
+                    garment_eval.to_mesh_clear()
+
+            if not combined_verts or not combined_tris:
+                self.report({"WARNING"}, "No garment triangles found in the selected collection")
+                return {"CANCELLED"}
+
+            bvh_garments = BVHTree.FromPolygons(combined_verts, combined_tris, all_triangles=True, epsilon=0.0)
+
+            vg = ensure_vertex_group(body_obj, CG_VG_BODY_MASK)
+            clear_vertex_group(body_obj, vg)
+
             b_mw = body_eval.matrix_world
             affected = 0
             for i, v in enumerate(body_mesh.vertices):
                 world_co = b_mw @ v.co
-                nearest = bvh_garment.find_nearest(world_co)
+                # Convert body vertex to body local for the combined BVH (it is already in body local, but keep explicit).
+                body_local = body_mw_inv @ world_co
+                nearest = bvh_garments.find_nearest(body_local)
                 if nearest is None:
                     continue
                 _, _, _, dist = nearest
@@ -192,50 +244,58 @@ class CG_OT_detect_clipping(Operator):
         settings = _settings(context)
         validated = _validate_assigned_meshes(settings)
         if validated is None:
-            self.report({"ERROR"}, "Assign valid Body and Garment mesh objects first")
+            self.report({"ERROR"}, "Assign a valid Body mesh and a Garment Collection (or legacy Garment Object) first")
             return {"CANCELLED"}
-        body_obj, garment_obj = validated
+        body_obj, garments = validated
 
         depsgraph = context.evaluated_depsgraph_get()
-        try:
-            res = detect_clipping(
-                garment_obj=garment_obj,
-                body_obj=body_obj,
-                depsgraph=depsgraph,
-                offset_distance=settings.offset_distance,
-                detection_radius=max(settings.offset_distance, settings.detection_radius),
-                use_risk_area=settings.use_risk_area,
-            )
-        except Exception as e:
-            self.report({"ERROR"}, str(e))
-            return {"CANCELLED"}
+        total_checked = 0
+        total_candidates = 0
+        total_flagged = 0
+        global_min = None
 
-        hard = [0.0] * len(garment_obj.data.vertices)
-        for i in res.clipping_indices:
-            hard[i] = 1.0
-        affected = write_weights_to_vertex_group(garment_obj, CG_VG_CLIPPING, hard)
-
-        s = res.stats
-        min_d = s.min_nearest_distance
-        avg_d = s.avg_flagged_distance
-        min_txt = f"{min_d:.6f} m" if min_d is not None else "n/a"
-        avg_txt = f"{avg_d:.6f} m" if avg_d is not None else "n/a"
-
-        if affected > 0:
-            msg = (
-                f"Checked {s.checked_verts} garment verts; {s.candidates_within_radius} within radius; "
-                f"{affected} flagged as clipping; min distance {min_txt}; avg flagged {avg_txt}"
-            )
-        else:
-            if s.candidates_within_radius > 0:
-                msg = (
-                    f"No clipping under current threshold; checked {s.checked_verts} verts; "
-                    f"{s.candidates_within_radius} within radius; min distance {min_txt}"
+        for garment_obj in garments:
+            try:
+                res = detect_clipping(
+                    garment_obj=garment_obj,
+                    body_obj=body_obj,
+                    depsgraph=depsgraph,
+                    offset_distance=settings.offset_distance,
+                    detection_radius=max(settings.offset_distance, settings.detection_radius),
+                    use_risk_area=settings.use_risk_area,
                 )
-            else:
-                msg = f"Checked {s.checked_verts} garment verts; min distance {min_txt}"
+            except Exception as e:
+                self.report({"WARNING"}, f"{garment_obj.name}: {e}")
+                continue
 
-        print("[Cloth Guard][Detect]", msg)
+            hard = [0.0] * len(garment_obj.data.vertices)
+            for i in res.clipping_indices:
+                if i < len(hard):
+                    hard[i] = 1.0
+            affected = write_weights_to_vertex_group(garment_obj, CG_VG_CLIPPING, hard)
+
+            s = res.stats
+            total_checked += s.checked_verts
+            total_candidates += s.candidates_within_radius
+            total_flagged += affected
+            if s.min_nearest_distance is not None:
+                global_min = s.min_nearest_distance if global_min is None else min(global_min, s.min_nearest_distance)
+
+            min_txt = f"{s.min_nearest_distance:.6f} m" if s.min_nearest_distance is not None else "n/a"
+            print(
+                "[Cloth Guard][Detect]",
+                garment_obj.name,
+                f"checked={s.checked_verts}",
+                f"candidates={s.candidates_within_radius}",
+                f"flagged={affected}",
+                f"min={min_txt}",
+            )
+
+        global_min_txt = f"{global_min:.6f} m" if global_min is not None else "n/a"
+        msg = (
+            f"Processed {len(garments)} garment(s); checked {total_checked} verts; "
+            f"{total_candidates} within radius; {total_flagged} flagged; min distance {global_min_txt}"
+        )
         self.report({"INFO"}, msg)
         return {"FINISHED"}
 
@@ -250,9 +310,14 @@ class CG_OT_select_clipping_vertices(Operator):
         settings = _settings(context)
         validated = _validate_assigned_meshes(settings)
         if validated is None:
-            self.report({"ERROR"}, "Assign valid Body and Garment mesh objects first")
+            self.report({"ERROR"}, "Assign a valid Body mesh and a Garment Collection (or legacy Garment Object) first")
             return {"CANCELLED"}
-        _, garment_obj = validated
+        _, garments = validated
+
+        garment_obj = context.view_layer.objects.active
+        if garment_obj is None or garment_obj.type != "MESH" or garment_obj not in garments:
+            self.report({"ERROR"}, "Make a garment mesh (from the Garment Collection) the active object, then run Select")
+            return {"CANCELLED"}
 
         vg = garment_obj.vertex_groups.get(CG_VG_CLIPPING)
         if vg is None:
@@ -300,58 +365,70 @@ class CG_OT_correct_current_pose(Operator):
         settings = _settings(context)
         validated = _validate_assigned_meshes(settings)
         if validated is None:
-            self.report({"ERROR"}, "Assign valid Body and Garment mesh objects first")
+            self.report({"ERROR"}, "Assign a valid Body mesh and a Garment Collection (or legacy Garment Object) first")
             return {"CANCELLED"}
-        body_obj, garment_obj = validated
+        body_obj, garments = validated
 
         depsgraph = context.evaluated_depsgraph_get()
 
-        # Update clipping group + gather debug stats.
-        try:
-            det = detect_clipping(
-                garment_obj=garment_obj,
-                body_obj=body_obj,
-                depsgraph=depsgraph,
-                offset_distance=settings.offset_distance,
-                detection_radius=max(settings.offset_distance, settings.detection_radius),
-                use_risk_area=settings.use_risk_area,
-            )
-        except Exception as e:
-            self.report({"ERROR"}, str(e))
-            return {"CANCELLED"}
+        total_checked = 0
+        total_candidates = 0
+        total_flagged = 0
+        total_corrected = 0
+        global_min = None
 
-        hard = [0.0] * len(garment_obj.data.vertices)
-        for i in det.clipping_indices:
-            hard[i] = 1.0
-        write_weights_to_vertex_group(garment_obj, CG_VG_CLIPPING, hard)
+        for garment_obj in garments:
+            try:
+                det = detect_clipping(
+                    garment_obj=garment_obj,
+                    body_obj=body_obj,
+                    depsgraph=depsgraph,
+                    offset_distance=settings.offset_distance,
+                    detection_radius=max(settings.offset_distance, settings.detection_radius),
+                    use_risk_area=settings.use_risk_area,
+                )
+            except Exception as e:
+                self.report({"WARNING"}, f"{garment_obj.name}: {e}")
+                continue
 
-        # Apply correction based on evaluated geometry.
-        try:
-            stats = correct_current_pose(
-                garment_obj=garment_obj,
-                body_obj=body_obj,
-                depsgraph=depsgraph,
-                offset_distance=settings.offset_distance,
-                detection_radius=max(settings.offset_distance, settings.detection_radius),
-                correction_strength=settings.correction_strength,
-                max_push_distance=settings.max_push_distance,
-                smooth_iterations=settings.smooth_iterations,
-                smooth_strength=settings.smooth_strength,
-                use_risk_area=settings.use_risk_area,
-                preserve_pinned_areas=settings.preserve_pinned_areas,
-            )
-        except Exception as e:
-            self.report({"ERROR"}, str(e))
-            return {"CANCELLED"}
+            hard = [0.0] * len(garment_obj.data.vertices)
+            for i in det.clipping_indices:
+                if i < len(hard):
+                    hard[i] = 1.0
+            flagged = write_weights_to_vertex_group(garment_obj, CG_VG_CLIPPING, hard)
+
+            try:
+                stats = correct_current_pose(
+                    garment_obj=garment_obj,
+                    body_obj=body_obj,
+                    depsgraph=depsgraph,
+                    offset_distance=settings.offset_distance,
+                    detection_radius=max(settings.offset_distance, settings.detection_radius),
+                    correction_strength=settings.correction_strength,
+                    max_push_distance=settings.max_push_distance,
+                    smooth_iterations=settings.smooth_iterations,
+                    smooth_strength=settings.smooth_strength,
+                    use_risk_area=settings.use_risk_area,
+                    preserve_pinned_areas=settings.preserve_pinned_areas,
+                )
+            except Exception as e:
+                self.report({"WARNING"}, f"{garment_obj.name}: correction failed: {e}")
+                continue
+
+            s = det.stats
+            total_checked += s.checked_verts
+            total_candidates += s.candidates_within_radius
+            total_flagged += flagged
+            total_corrected += stats.corrected_verts
+            if s.min_nearest_distance is not None:
+                global_min = s.min_nearest_distance if global_min is None else min(global_min, s.min_nearest_distance)
 
         settings.enable_live_anti_clip = True
-
-        s = det.stats
-        min_d = s.min_nearest_distance
-        min_txt = f"{min_d:.6f} m" if min_d is not None else "n/a"
+        global_min_txt = f"{global_min:.6f} m" if global_min is not None else "n/a"
         msg = (
-            f"Checked {s.checked_verts} verts; {s.candidates_within_radius} within radius; "
-            f"{s.flagged_clipping} flagged; corrected {stats.corrected_verts}; min distance {min_txt}"
+            f"Processed {len(garments)} garment(s); checked {total_checked} verts; "
+            f"{total_candidates} within radius; {total_flagged} flagged; corrected {total_corrected}; "
+            f"min distance {global_min_txt}"
         )
         print("[Cloth Guard][Correct]", msg)
         self.report({"INFO"}, msg)
@@ -369,32 +446,37 @@ class CG_OT_refresh_live_correction(Operator):
         settings = _settings(context)
         validated = _validate_assigned_meshes(settings)
         if validated is None:
-            self.report({"ERROR"}, "Assign valid Body and Garment mesh objects first")
+            self.report({"ERROR"}, "Assign a valid Body mesh and a Garment Collection (or legacy Garment Object) first")
             return {"CANCELLED"}
-        body_obj, garment_obj = validated
+        body_obj, garments = validated
 
         depsgraph = context.evaluated_depsgraph_get()
-        try:
-            stats = correct_current_pose(
-                garment_obj=garment_obj,
-                body_obj=body_obj,
-                depsgraph=depsgraph,
-                offset_distance=settings.offset_distance,
-                detection_radius=max(settings.offset_distance, settings.detection_radius),
-                correction_strength=settings.correction_strength,
-                max_push_distance=settings.max_push_distance,
-                smooth_iterations=settings.smooth_iterations,
-                smooth_strength=settings.smooth_strength,
-                use_risk_area=settings.use_risk_area,
-                preserve_pinned_areas=settings.preserve_pinned_areas,
-            )
-        except Exception as e:
-            self.report({"ERROR"}, str(e))
-            return {"CANCELLED"}
+        total_corrected = 0
+        global_min = None
+        for garment_obj in garments:
+            try:
+                stats = correct_current_pose(
+                    garment_obj=garment_obj,
+                    body_obj=body_obj,
+                    depsgraph=depsgraph,
+                    offset_distance=settings.offset_distance,
+                    detection_radius=max(settings.offset_distance, settings.detection_radius),
+                    correction_strength=settings.correction_strength,
+                    max_push_distance=settings.max_push_distance,
+                    smooth_iterations=settings.smooth_iterations,
+                    smooth_strength=settings.smooth_strength,
+                    use_risk_area=settings.use_risk_area,
+                    preserve_pinned_areas=settings.preserve_pinned_areas,
+                )
+            except Exception as e:
+                self.report({"WARNING"}, f"{garment_obj.name}: {e}")
+                continue
+            total_corrected += stats.corrected_verts
+            if stats.min_nearest_distance is not None:
+                global_min = stats.min_nearest_distance if global_min is None else min(global_min, stats.min_nearest_distance)
 
-        min_d = stats.min_nearest_distance
-        min_txt = f"{min_d:.6f} m" if min_d is not None else "n/a"
-        self.report({"INFO"}, f"Refreshed live correction (corrected {stats.corrected_verts}; min distance {min_txt})")
+        min_txt = f"{global_min:.6f} m" if global_min is not None else "n/a"
+        self.report({"INFO"}, f"Refreshed live correction (corrected {total_corrected}; min distance {min_txt})")
         return {"FINISHED"}
 
 
@@ -408,9 +490,14 @@ class CG_OT_create_corrective_shapekey(Operator):
         settings = _settings(context)
         validated = _validate_assigned_meshes(settings)
         if validated is None:
-            self.report({"ERROR"}, "Assign valid Body and Garment mesh objects first")
+            self.report({"ERROR"}, "Assign a valid Body mesh and a Garment Collection (or legacy Garment Object) first")
             return {"CANCELLED"}
-        body_obj, garment_obj = validated
+        _, garments = validated
+
+        garment_obj = context.view_layer.objects.active
+        if garment_obj is None or garment_obj.type != "MESH" or garment_obj not in garments:
+            self.report({"ERROR"}, "Make a garment mesh (from the Garment Collection) the active object to bake a corrective")
+            return {"CANCELLED"}
 
         # Ensure live correction exists and is enabled so baking includes it.
         ensure_live_correction_shapekey(garment_obj)
