@@ -24,6 +24,7 @@ from bpy.types import Operator
 from .utils import (
     CG_MOD_BODY_MASK,
     CG_VG_BODY_MASK,
+    CG_VG_CONTACT,
     CG_VG_CLIPPING,
     CG_SHAPEKEY_LIVE,
     add_shapekey_driver_rotation_range,
@@ -391,7 +392,8 @@ class CG_OT_detect_clipping(Operator):
             depsgraph = context.evaluated_depsgraph_get()
             total_checked = 0
             total_candidates = 0
-            total_flagged = 0
+            total_contact = 0
+            total_clipping = 0
             global_min = None
 
             for garment_obj in garments:
@@ -408,16 +410,14 @@ class CG_OT_detect_clipping(Operator):
                     self.report({"WARNING"}, f"{garment_obj.name}: {e}")
                     continue
 
-                hard = [0.0] * len(garment_obj.data.vertices)
-                for i in res.clipping_indices:
-                    if i < len(hard):
-                        hard[i] = 1.0
-                affected = write_weights_to_vertex_group(garment_obj, CG_VG_CLIPPING, hard)
+                contact_affected = write_weights_to_vertex_group(garment_obj, CG_VG_CONTACT, res.contact_weights)
+                clipping_affected = write_weights_to_vertex_group(garment_obj, CG_VG_CLIPPING, res.clipping_weights)
 
                 s = res.stats
                 total_checked += s.checked_verts
                 total_candidates += s.candidates_within_radius
-                total_flagged += affected
+                total_contact += contact_affected
+                total_clipping += clipping_affected
                 if s.min_nearest_distance is not None:
                     global_min = (
                         s.min_nearest_distance
@@ -431,14 +431,15 @@ class CG_OT_detect_clipping(Operator):
                     garment_obj.name,
                     f"checked={s.checked_verts}",
                     f"candidates={s.candidates_within_radius}",
-                    f"flagged={affected}",
+                    f"contact={contact_affected}",
+                    f"clipping={clipping_affected}",
                     f"min={min_txt}",
                 )
 
         global_min_txt = f"{global_min:.6f} m" if global_min is not None else "n/a"
         msg = (
             f"Processed {len(garments)} garment(s); checked {total_checked} verts; "
-            f"{total_candidates} within radius; {total_flagged} flagged; min distance {global_min_txt}"
+            f"{total_candidates} within radius; {total_contact} contact; {total_clipping} clipping; min distance {global_min_txt}"
         )
         self.report({"INFO"}, msg)
         return {"FINISHED"}
@@ -518,7 +519,8 @@ class CG_OT_correct_current_pose(Operator):
 
             total_checked = 0
             total_candidates = 0
-            total_flagged = 0
+            total_contact = 0
+            total_clipping = 0
             total_corrected = 0
             global_min = None
 
@@ -536,11 +538,8 @@ class CG_OT_correct_current_pose(Operator):
                     self.report({"WARNING"}, f"{garment_obj.name}: {e}")
                     continue
 
-                hard = [0.0] * len(garment_obj.data.vertices)
-                for i in det.clipping_indices:
-                    if i < len(hard):
-                        hard[i] = 1.0
-                flagged = write_weights_to_vertex_group(garment_obj, CG_VG_CLIPPING, hard)
+                contact_affected = write_weights_to_vertex_group(garment_obj, CG_VG_CONTACT, det.contact_weights)
+                clipping_affected = write_weights_to_vertex_group(garment_obj, CG_VG_CLIPPING, det.clipping_weights)
 
                 try:
                     stats = correct_current_pose(
@@ -563,7 +562,8 @@ class CG_OT_correct_current_pose(Operator):
                 s = det.stats
                 total_checked += s.checked_verts
                 total_candidates += s.candidates_within_radius
-                total_flagged += flagged
+                total_contact += contact_affected
+                total_clipping += clipping_affected
                 total_corrected += stats.corrected_verts
                 if s.min_nearest_distance is not None:
                     global_min = (
@@ -576,7 +576,7 @@ class CG_OT_correct_current_pose(Operator):
             global_min_txt = f"{global_min:.6f} m" if global_min is not None else "n/a"
             msg = (
                 f"Processed {len(garments)} garment(s); checked {total_checked} verts; "
-                f"{total_candidates} within radius; {total_flagged} flagged; corrected {total_corrected}; "
+                f"{total_candidates} within radius; {total_contact} contact; {total_clipping} clipping; corrected {total_corrected}; "
                 f"min distance {global_min_txt}"
             )
             print("[Cloth Guard][Correct]", msg)

@@ -25,6 +25,7 @@ from mathutils import Vector
 from mathutils.bvhtree import BVHTree
 
 CG_VG_BODY_MASK = "CG_BodyMask"
+CG_VG_CONTACT = "CG_Contact"
 CG_VG_CLIPPING = "CG_Clipping"
 
 CG_VG_RISK = "CG_RiskArea"
@@ -95,6 +96,7 @@ class ProximityWeightsResult:
 class ClipDetectionStats:
     checked_verts: int
     candidates_within_radius: int
+    flagged_contact: int
     flagged_clipping: int
     min_nearest_distance: float | None
     avg_flagged_distance: float | None
@@ -103,9 +105,33 @@ class ClipDetectionStats:
 @dataclass(frozen=True)
 class ClipDetectionResult:
     stats: ClipDetectionStats
-    clipping_indices: list[int]
-    candidate_indices: list[int]
+    contact_weights: list[float]
+    clipping_weights: list[float]
     nearest_distances: list[float | None]
+
+
+def _boundary_vertex_mask(mesh: bpy.types.Mesh) -> list[bool]:
+    """
+    Return a boolean mask of boundary vertices for the given base mesh.
+
+    We intentionally avoid relying on MeshEdge.is_boundary (not present in all
+    Blender versions) and compute boundary edges by counting polygon edge usage.
+    """
+    boundary = [False] * len(mesh.vertices)
+    if len(mesh.vertices) == 0:
+        return boundary
+
+    edge_use: dict[tuple[int, int], int] = {}
+    for poly in mesh.polygons:
+        for a, b in poly.edge_keys:
+            key = (int(a), int(b))
+            edge_use[key] = edge_use.get(key, 0) + 1
+
+    for (a, b), count in edge_use.items():
+        if count == 1:
+            boundary[a] = True
+            boundary[b] = True
+    return boundary
 
 
 def _safe_min(values: Iterable[float | None]) -> float | None:
@@ -180,8 +206,9 @@ def detect_clipping(
     """
     Robust MVP clipping detection on evaluated (deformed) meshes:
     - Proximity candidates via nearest surface distance (body-local BVH queries)
-    - Penetration heuristic using nearest surface normal (dot < 0)
-    - Face overlap heuristic via BVH overlap (catches face intersections even if no vertex is inside)
+    - Contact weights for near-body vertices (CG_Contact)
+    - Clipping weights for likely penetration (CG_Clipping), using surface normals (dot < 0)
+    - Optional overlap heuristic, gated by a secondary penetration check (reduces false positives)
     """
     offset_distance = max(0.0, float(offset_distance))
     detection_radius = max(offset_distance, float(detection_radius))
@@ -212,19 +239,33 @@ def detect_clipping(
         bvh_body = BVHTree.FromPolygons(body_verts, body_tris, all_triangles=True, epsilon=0.0)
         risk_idx = _vertex_group_index(garment_obj, CG_VG_RISK) if use_risk_area else None
 
+        collar_idx = _vertex_group_index(garment_obj, CG_VG_PRESERVE_COLLAR)
+        hem_idx = _vertex_group_index(garment_obj, CG_VG_PRESERVE_HEM)
+        seams_idx = _vertex_group_index(garment_obj, CG_VG_PRESERVE_SEAMS)
+        preserve_scale_contact = 0.75
+        preserve_scale_clipping = 0.25
+
+        # Boundary attenuation helps avoid noisy selections on open edges (collars/hem boundaries).
+        boundary_mask = _boundary_vertex_mask(base_mesh)
+        boundary_contact_scale = 0.25
+        boundary_clipping_scale = 0.6
+
         # When normals are noisy or inconsistent, require a small negative dot to call it penetration.
         penetration_eps = max(1e-6, offset_distance * 0.05)
 
-        nearest_distances: list[float | None] = [None] * len(garment_mesh.vertices)
-        candidate_indices: list[int] = []
-        clipping_set: set[int] = set()
+        contact_weights: list[float] = [0.0] * base_vert_count
+        clipping_weights: list[float] = [0.0] * base_vert_count
+        nearest_distances: list[float | None] = [None] * base_vert_count
 
         checked = 0
         candidates = 0
         debug_printed = 0
 
         for i, v in enumerate(garment_mesh.vertices):
-            if risk_idx is not None and vertex_count_matches:
+            if i >= base_vert_count:
+                break
+
+            if risk_idx is not None:
                 if _vertex_weight(base_mesh.vertices[i], risk_idx) <= 0.0:
                     continue
 
@@ -237,24 +278,53 @@ def detect_clipping(
             nearest_co, nearest_no, _, dist = nearest
             if dist is None:
                 dist = (garment_in_body - nearest_co).length
-            nearest_distances[i] = float(dist)
+            dist = float(dist)
+            nearest_distances[i] = dist
 
             if dist <= detection_radius:
                 candidates += 1
-                candidate_indices.append(i)
+                if detection_radius == offset_distance:
+                    contact_w = 1.0
+                elif dist <= offset_distance:
+                    contact_w = 1.0
+                else:
+                    contact_w = (detection_radius - dist) / (detection_radius - offset_distance)
+                    contact_w = max(0.0, min(1.0, float(contact_w)))
 
-                is_clipping = dist <= offset_distance
-                if not is_clipping and nearest_no is not None:
+                clip_w = 0.0
+                if nearest_no is not None:
                     vec = garment_in_body - nearest_co
-                    # dot < 0 means vertex lies "inside" the body if body normals point outward.
-                    if vec.dot(nearest_no) < -penetration_eps:
-                        is_clipping = True
+                    signed = float(vec.dot(nearest_no))
+                    if signed < -penetration_eps:
+                        # Depth-based weight (0..1 over ~offset_distance of penetration).
+                        denom = max(1e-8, offset_distance)
+                        clip_w = max(0.0, min(1.0, (-signed) / denom))
 
-                if is_clipping:
-                    if i < base_vert_count:
-                        clipping_set.add(i)
+                preserve_w = 0.0
+                if collar_idx is not None:
+                    preserve_w = max(preserve_w, _vertex_weight(base_mesh.vertices[i], collar_idx))
+                if hem_idx is not None:
+                    preserve_w = max(preserve_w, _vertex_weight(base_mesh.vertices[i], hem_idx))
+                if seams_idx is not None:
+                    preserve_w = max(preserve_w, _vertex_weight(base_mesh.vertices[i], seams_idx))
+                if preserve_w > 0.0:
+                    contact_w *= max(0.0, 1.0 - preserve_w * preserve_scale_contact)
+                    clip_w *= max(0.0, 1.0 - preserve_w * preserve_scale_clipping)
+
+                if boundary_mask[i]:
+                    contact_w *= boundary_contact_scale
+                    clip_w *= boundary_clipping_scale
+
+                if contact_w > contact_weights[i]:
+                    contact_weights[i] = contact_w
+                if clip_w > clipping_weights[i]:
+                    clipping_weights[i] = clip_w
 
                 if debug_printed < 3:
+                    signed_txt = "n/a"
+                    if nearest_no is not None:
+                        vec = garment_in_body - nearest_co
+                        signed_txt = f"{float(vec.dot(nearest_no)):.6f}"
                     world_co = garment_mw @ v.co
                     print(
                         "[Cloth Guard][Detect][Sample]",
@@ -263,10 +333,12 @@ def detect_clipping(
                         f"g_body=({garment_in_body.x:.4f},{garment_in_body.y:.4f},{garment_in_body.z:.4f})",
                         f"nearest=({nearest_co.x:.4f},{nearest_co.y:.4f},{nearest_co.z:.4f})",
                         f"dist={float(dist):.6f}",
+                        f"signed={signed_txt}",
                     )
                     debug_printed += 1
 
-        # Face overlap heuristic.
+        # Face overlap heuristic (gated). BVHTree.overlap can be noisy on dense meshes, so we
+        # only escalate to clipping when a secondary penetration check agrees.
         garment_mesh.calc_loop_triangles()
         garment_verts_body = [garment_to_body @ v.co for v in garment_mesh.vertices]
         garment_tris = [tuple(lt.vertices) for lt in garment_mesh.loop_triangles]
@@ -278,26 +350,53 @@ def detect_clipping(
                 g_idx = int(g_tri_idx)
                 if g_idx >= len(garment_mesh.loop_triangles):
                     continue
-                for vi in garment_mesh.loop_triangles[g_idx].vertices:
-                    idx = int(vi)
-                    if risk_idx is not None and vertex_count_matches and _vertex_weight(base_mesh.vertices[idx], risk_idx) <= 0.0:
-                        continue
-                    if idx < base_vert_count:
-                        clipping_set.add(idx)
+                tri = garment_mesh.loop_triangles[g_idx]
+                # Only usable for base-mesh mapping when indices are in range.
+                if any(int(vi) >= base_vert_count for vi in tri.vertices):
+                    continue
 
-        clipping_indices = sorted(clipping_set)
-        flagged_dists = [nearest_distances[i] for i in clipping_indices]
+                centroid = (garment_verts_body[int(tri.vertices[0])] + garment_verts_body[int(tri.vertices[1])] + garment_verts_body[int(tri.vertices[2])]) / 3.0
+                nearest = bvh_body.find_nearest(centroid)
+                if nearest is None:
+                    continue
+                nearest_co, nearest_no, _, dist = nearest
+                if dist is None:
+                    dist = (centroid - nearest_co).length
+                dist = float(dist)
+
+                penetrates = False
+                if nearest_no is not None:
+                    vec = centroid - nearest_co
+                    if float(vec.dot(nearest_no)) < -penetration_eps:
+                        penetrates = True
+                if not penetrates and dist <= (offset_distance * 0.15):
+                    penetrates = True
+                if not penetrates:
+                    continue
+
+                for vi in tri.vertices:
+                    idx = int(vi)
+                    if risk_idx is not None and _vertex_weight(base_mesh.vertices[idx], risk_idx) <= 0.0:
+                        continue
+                    # Escalate: intersection-like evidence.
+                    clipping_weights[idx] = max(clipping_weights[idx], 1.0)
+                    contact_weights[idx] = max(contact_weights[idx], 1.0)
+
+        flagged_contact = sum(1 for w in contact_weights if w > 0.0)
+        flagged_clipping = sum(1 for w in clipping_weights if w > 0.0)
+        flagged_dists = [d for i, d in enumerate(nearest_distances) if d is not None and clipping_weights[i] > 0.0]
         stats = ClipDetectionStats(
             checked_verts=checked,
             candidates_within_radius=candidates,
-            flagged_clipping=len(clipping_indices),
+            flagged_contact=flagged_contact,
+            flagged_clipping=flagged_clipping,
             min_nearest_distance=_safe_min(nearest_distances),
             avg_flagged_distance=_safe_avg(flagged_dists),
         )
         return ClipDetectionResult(
             stats=stats,
-            clipping_indices=clipping_indices,
-            candidate_indices=candidate_indices,
+            contact_weights=contact_weights,
+            clipping_weights=clipping_weights,
             nearest_distances=nearest_distances,
         )
     finally:
@@ -362,6 +461,9 @@ def correct_current_pose(
         hem_idx = _vertex_group_index(garment_obj, CG_VG_PRESERVE_HEM)
         seams_idx = _vertex_group_index(garment_obj, CG_VG_PRESERVE_SEAMS)
 
+        boundary_mask = _boundary_vertex_mask(base_mesh)
+        boundary_scale = 0.25
+
         preserve_scale = 0.5
         penetration_eps = max(1e-6, offset_distance * 0.05)
 
@@ -405,6 +507,10 @@ def correct_current_pose(
                 push_amount = min(push_amount, max_push_distance)
 
             push_amount *= correction_strength
+            if not inside and offset_distance > 1e-8:
+                # Softer influence for "near contact" (outside) compared to penetration.
+                tight = max(0.0, min(1.0, (offset_distance - dist) / offset_distance))
+                push_amount *= tight
             if push_amount <= 0.0:
                 continue
 
@@ -424,6 +530,9 @@ def correct_current_pose(
                 preserve_w = max(preserve_w, _vertex_weight(base_mesh.vertices[i], seams_idx))
             if preserve_w > 0.0:
                 scale *= max(0.0, 1.0 - preserve_w * preserve_scale)
+
+            if boundary_mask[i]:
+                scale *= boundary_scale
 
             if scale <= 0.0:
                 continue
