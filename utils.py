@@ -179,7 +179,7 @@ def detect_clipping(
 ) -> ClipDetectionResult:
     """
     Robust MVP clipping detection on evaluated (deformed) meshes:
-    - Proximity candidates via nearest surface distance (world space)
+    - Proximity candidates via nearest surface distance (body-local BVH queries)
     - Penetration heuristic using nearest surface normal (dot < 0)
     - Face overlap heuristic via BVH overlap (catches face intersections even if no vertex is inside)
     """
@@ -189,45 +189,51 @@ def detect_clipping(
     garment_eval = garment_obj.evaluated_get(depsgraph)
     body_eval = body_obj.evaluated_get(depsgraph)
 
-    bvh_body = build_bvh(body_eval, depsgraph)
-    bvh_garment = build_bvh(garment_eval, depsgraph)
-
-    mesh_eval = garment_eval.to_mesh()
+    body_mesh = body_eval.to_mesh()
+    garment_mesh = garment_eval.to_mesh()
     try:
         base_mesh = garment_obj.data
-        if len(mesh_eval.vertices) != len(base_mesh.vertices):
-            raise RuntimeError(
-                "Garment evaluated mesh vertex count differs from base mesh. "
-                "Disable topology-changing modifiers (Subdivision, Remesh, etc.) for detection."
+        base_vert_count = len(base_mesh.vertices)
+        vertex_count_matches = len(garment_mesh.vertices) == base_vert_count
+        if not vertex_count_matches:
+            print(
+                "[Cloth Guard][Detect] WARNING: evaluated garment vertex count differs from base mesh. "
+                "Topology-changing modifiers are likely enabled; CG_Clipping mapping to the base mesh may be incomplete."
             )
 
-        g_mw = garment_eval.matrix_world
+        body_mw = body_eval.matrix_world
+        garment_mw = garment_eval.matrix_world
+        garment_to_body = body_mw.inverted_safe() @ garment_mw
+
+        # BVH is built in evaluated BODY LOCAL SPACE.
+        bvh_body = BVHTree.FromMesh(body_mesh, epsilon=0.0)
         risk_idx = _vertex_group_index(garment_obj, CG_VG_RISK) if use_risk_area else None
 
         # When normals are noisy or inconsistent, require a small negative dot to call it penetration.
         penetration_eps = max(1e-6, offset_distance * 0.05)
 
-        nearest_distances: list[float | None] = [None] * len(mesh_eval.vertices)
+        nearest_distances: list[float | None] = [None] * len(garment_mesh.vertices)
         candidate_indices: list[int] = []
         clipping_set: set[int] = set()
 
         checked = 0
         candidates = 0
+        debug_printed = 0
 
-        for i, v in enumerate(mesh_eval.vertices):
-            if risk_idx is not None:
+        for i, v in enumerate(garment_mesh.vertices):
+            if risk_idx is not None and vertex_count_matches:
                 if _vertex_weight(base_mesh.vertices[i], risk_idx) <= 0.0:
                     continue
 
             checked += 1
-            world_co = g_mw @ v.co
-            nearest = bvh_body.find_nearest(world_co)
+            garment_in_body = garment_to_body @ v.co
+            nearest = bvh_body.find_nearest(garment_in_body)
             if nearest is None:
                 continue
 
             nearest_co, nearest_no, _, dist = nearest
             if dist is None:
-                dist = (world_co - nearest_co).length
+                dist = (garment_in_body - nearest_co).length
             nearest_distances[i] = float(dist)
 
             if dist <= detection_radius:
@@ -236,34 +242,44 @@ def detect_clipping(
 
                 is_clipping = dist <= offset_distance
                 if not is_clipping and nearest_no is not None:
-                    vec = world_co - nearest_co
+                    vec = garment_in_body - nearest_co
                     # dot < 0 means vertex lies "inside" the body if body normals point outward.
                     if vec.dot(nearest_no) < -penetration_eps:
                         is_clipping = True
 
                 if is_clipping:
-                    clipping_set.add(i)
+                    if i < base_vert_count:
+                        clipping_set.add(i)
+
+                if debug_printed < 3:
+                    world_co = garment_mw @ v.co
+                    print(
+                        "[Cloth Guard][Detect][Sample]",
+                        f"idx={i}",
+                        f"g_world=({world_co.x:.4f},{world_co.y:.4f},{world_co.z:.4f})",
+                        f"g_body=({garment_in_body.x:.4f},{garment_in_body.y:.4f},{garment_in_body.z:.4f})",
+                        f"nearest=({nearest_co.x:.4f},{nearest_co.y:.4f},{nearest_co.z:.4f})",
+                        f"dist={float(dist):.6f}",
+                    )
+                    debug_printed += 1
 
         # Face overlap heuristic.
-        overlaps = bvh_body.overlap(bvh_garment)
+        garment_verts_body = [garment_to_body @ v.co for v in garment_mesh.vertices]
+        garment_polys = [list(p.vertices) for p in garment_mesh.polygons]
+        bvh_garment_local = BVHTree.FromPolygons(garment_verts_body, garment_polys, all_triangles=False, epsilon=0.0)
+
+        overlaps = bvh_body.overlap(bvh_garment_local)
         if overlaps:
-            mesh_eval.calc_loop_triangles()
             for _, g_poly_idx in overlaps:
                 g_idx = int(g_poly_idx)
-                poly = None
-                if g_idx < len(mesh_eval.polygons):
-                    poly = mesh_eval.polygons[g_idx]
-                elif g_idx < len(mesh_eval.loop_triangles):
-                    poly_i = mesh_eval.loop_triangles[g_idx].polygon_index
-                    if poly_i < len(mesh_eval.polygons):
-                        poly = mesh_eval.polygons[poly_i]
-                if poly is None:
+                if g_idx >= len(garment_mesh.polygons):
                     continue
-                for vi in poly.vertices:
+                for vi in garment_mesh.polygons[g_idx].vertices:
                     idx = int(vi)
-                    if risk_idx is not None and _vertex_weight(base_mesh.vertices[idx], risk_idx) <= 0.0:
+                    if risk_idx is not None and vertex_count_matches and _vertex_weight(base_mesh.vertices[idx], risk_idx) <= 0.0:
                         continue
-                    clipping_set.add(idx)
+                    if idx < base_vert_count:
+                        clipping_set.add(idx)
 
         clipping_indices = sorted(clipping_set)
         flagged_dists = [nearest_distances[i] for i in clipping_indices]
@@ -281,6 +297,7 @@ def detect_clipping(
             nearest_distances=nearest_distances,
         )
     finally:
+        body_eval.to_mesh_clear()
         garment_eval.to_mesh_clear()
 
 
@@ -312,19 +329,25 @@ def correct_current_pose(
 
     garment_eval = garment_obj.evaluated_get(depsgraph)
     body_eval = body_obj.evaluated_get(depsgraph)
-    bvh_body = build_bvh(body_eval, depsgraph)
 
-    mesh_eval = garment_eval.to_mesh()
+    body_mesh = body_eval.to_mesh()
+    garment_mesh = garment_eval.to_mesh()
     try:
         base_mesh = garment_obj.data
-        if len(mesh_eval.vertices) != len(base_mesh.vertices):
+        if len(garment_mesh.vertices) != len(base_mesh.vertices):
             raise RuntimeError(
                 "Garment evaluated mesh vertex count differs from base mesh. "
-                "Disable topology-changing modifiers for correction."
+                "For MVP correction, keep the garment modifier stack topology-stable (Armature/shape keys are OK; Subdivision/Remesh are not)."
             )
 
-        g_mw = garment_eval.matrix_world
-        inv_mw = garment_obj.matrix_world.inverted_safe()
+        body_mw = body_eval.matrix_world
+        garment_mw = garment_eval.matrix_world
+        garment_to_body = body_mw.inverted_safe() @ garment_mw
+
+        # BVH is built in evaluated BODY LOCAL SPACE.
+        bvh_body = BVHTree.FromMesh(body_mesh, epsilon=0.0)
+
+        inv_garment_world = garment_obj.matrix_world.inverted_safe()
 
         risk_idx = _vertex_group_index(garment_obj, CG_VG_RISK) if use_risk_area else None
         pinned_idx = _vertex_group_index(garment_obj, CG_VG_PINNED) if preserve_pinned_areas else None
@@ -335,41 +358,41 @@ def correct_current_pose(
         preserve_scale = 0.5
         penetration_eps = max(1e-6, offset_distance * 0.05)
 
-        deltas: list[Vector] = [Vector((0.0, 0.0, 0.0)) for _ in range(len(mesh_eval.vertices))]
+        deltas: list[Vector] = [Vector((0.0, 0.0, 0.0)) for _ in range(len(garment_mesh.vertices))]
         checked = 0
         corrected = 0
-        nearest_distances: list[float | None] = [None] * len(mesh_eval.vertices)
+        nearest_distances: list[float | None] = [None] * len(garment_mesh.vertices)
 
-        for i, v in enumerate(mesh_eval.vertices):
+        for i, v in enumerate(garment_mesh.vertices):
             if risk_idx is not None and _vertex_weight(base_mesh.vertices[i], risk_idx) <= 0.0:
                 continue
 
             checked += 1
-            world_co = g_mw @ v.co
-            nearest = bvh_body.find_nearest(world_co)
+            garment_in_body = garment_to_body @ v.co
+            nearest = bvh_body.find_nearest(garment_in_body)
             if nearest is None:
                 continue
             nearest_co, nearest_no, _, dist = nearest
             if dist is None:
-                dist = (world_co - nearest_co).length
+                dist = (garment_in_body - nearest_co).length
             dist = float(dist)
             nearest_distances[i] = dist
 
             if dist > detection_radius and dist > offset_distance:
                 continue
 
-            vec = world_co - nearest_co
+            vec = garment_in_body - nearest_co
             dot = vec.dot(nearest_no) if nearest_no is not None else vec.length
             inside = nearest_no is not None and dot < -penetration_eps
 
             if inside:
                 push_amount = offset_distance + (-dot)
-                push_dir = nearest_no
+                push_dir_body = nearest_no
             else:
                 if dist >= offset_distance:
                     continue
                 push_amount = offset_distance - dist
-                push_dir = vec.normalized() if vec.length > 1e-12 else (nearest_no if nearest_no is not None else Vector((0.0, 0.0, 1.0)))
+                push_dir_body = vec.normalized() if vec.length > 1e-12 else (nearest_no if nearest_no is not None else Vector((0.0, 0.0, 1.0)))
 
             if max_push_distance > 0.0:
                 push_amount = min(push_amount, max_push_distance)
@@ -398,8 +421,9 @@ def correct_current_pose(
             if scale <= 0.0:
                 continue
 
-            world_delta = push_dir.normalized() * (push_amount * scale)
-            local_delta = inv_mw.to_3x3() @ world_delta
+            push_dir_world = (body_mw.to_3x3() @ push_dir_body).normalized()
+            world_delta = push_dir_world * (push_amount * scale)
+            local_delta = inv_garment_world.to_3x3() @ world_delta
             deltas[i] = local_delta
             corrected += 1
 
@@ -422,6 +446,7 @@ def correct_current_pose(
             min_nearest_distance=_safe_min(nearest_distances),
         )
     finally:
+        body_eval.to_mesh_clear()
         garment_eval.to_mesh_clear()
 
 
@@ -522,6 +547,7 @@ def compute_proximity_weights(
                 affected += 1
                 weights[i] = w
     finally:
+        body_eval.to_mesh_clear()
         garment_eval.to_mesh_clear()
 
     return ProximityWeightsResult(weights=weights, affected_count=affected)
