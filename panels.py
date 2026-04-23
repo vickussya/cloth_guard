@@ -16,6 +16,21 @@
 
 import bpy
 from bpy.types import Panel
+from bpy.types import UIList
+
+
+class CG_UL_garments(UIList):
+    bl_idname = "CG_UL_garments"
+
+    def draw_item(
+        self, context, layout, data, item, icon, active_data, active_propname, index
+    ):
+        row = layout.row(align=True)
+        row.prop(item, "enabled", text="")
+        if item.object is None:
+            row.label(text="<None>", icon="MESH_DATA")
+        else:
+            row.prop(item, "object", text="", emboss=False, icon="MESH_DATA")
 
 
 class CG_PT_main(Panel):
@@ -32,16 +47,28 @@ class CG_PT_main(Panel):
         box = layout.box()
         box.label(text="Object Assignment")
         box.prop(settings, "body_object")
-        box.prop(settings, "garment_collection")
 
-        if settings.garment_collection is not None:
-            garment_meshes = [o for o in settings.garment_collection.all_objects if o.type == "MESH"]
-            sub = box.column(align=True)
-            sub.label(text=f"Garments: {len(garment_meshes)} mesh object(s)")
-            for obj in garment_meshes[:10]:
-                sub.label(text=f"- {obj.name}")
-            if len(garment_meshes) > 10:
-                sub.label(text="(more...)")
+        box.label(text="Garments")
+        row = box.row()
+        row.template_list(
+            "CG_UL_garments",
+            "",
+            settings,
+            "garments",
+            settings,
+            "active_garment_index",
+            rows=4,
+        )
+        col = row.column(align=True)
+        col.operator("cloth_guard.add_selected_garments", text="", icon="ADD")
+        col.operator("cloth_guard.remove_active_garment", text="", icon="REMOVE")
+        col.separator()
+        col.operator("cloth_guard.move_garment", text="", icon="TRIA_UP").direction = "UP"
+        col.operator("cloth_guard.move_garment", text="", icon="TRIA_DOWN").direction = "DOWN"
+
+        row = box.row(align=True)
+        row.operator("cloth_guard.add_selected_garments", text="Add Selected Garment(s)")
+        row.operator("cloth_guard.remove_active_garment", text="Remove")
 
         box = layout.box()
         box.label(text="Setup")

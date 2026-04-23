@@ -631,11 +631,21 @@ def cg_update_modifier_visibility(context) -> None:
         return
 
     garments = []
-    coll = getattr(settings, "garment_collection", None)
-    if coll is not None:
-        for obj in coll.all_objects:
-            if is_mesh_object(obj):
-                garments.append(obj)
+    # Preferred: explicit garment list.
+    for item in getattr(settings, "garments", []):
+        obj = getattr(item, "object", None)
+        if not getattr(item, "enabled", True):
+            continue
+        if is_mesh_object(obj):
+            garments.append(obj)
+
+    # Backwards-compatible fallbacks.
+    if not garments:
+        coll = getattr(settings, "garment_collection", None)
+        if coll is not None:
+            for obj in coll.all_objects:
+                if is_mesh_object(obj):
+                    garments.append(obj)
     if not garments:
         obj = getattr(settings, "garment_object", None)
         if is_mesh_object(obj):

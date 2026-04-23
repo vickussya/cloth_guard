@@ -27,22 +27,29 @@ bl_info = {
 import bpy
 
 from .operators import (
+    CG_OT_add_selected_garments,
     CG_OT_bake_corrections,
     CG_OT_correct_current_pose,
     CG_OT_create_body_mask,
     CG_OT_create_corrective_shapekey,
     CG_OT_detect_clipping,
+    CG_OT_move_garment,
+    CG_OT_remove_active_garment,
     CG_OT_select_clipping_vertices,
     CG_OT_refresh_live_correction,
     CG_OT_remove_setup,
     CG_OT_setup,
 )
-from .panels import CG_PT_main
-from .properties import CG_Settings, register_properties, unregister_properties
+from .panels import CG_PT_main, CG_UL_garments
+from .properties import CG_GarmentItem, CG_Settings, register_properties, unregister_properties
 
 
 CLASSES = (
+    CG_GarmentItem,
     CG_Settings,
+    CG_OT_add_selected_garments,
+    CG_OT_remove_active_garment,
+    CG_OT_move_garment,
     CG_OT_setup,
     CG_OT_remove_setup,
     CG_OT_create_body_mask,
@@ -52,6 +59,7 @@ CLASSES = (
     CG_OT_refresh_live_correction,
     CG_OT_create_corrective_shapekey,
     CG_OT_bake_corrections,
+    CG_UL_garments,
     CG_PT_main,
 )
 

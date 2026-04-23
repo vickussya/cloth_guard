@@ -41,6 +41,19 @@ def _settings(context):
     return context.scene.cg_settings
 
 
+def _garments_from_list(settings):
+    garments = []
+    for item in settings.garments:
+        obj = getattr(item, "object", None)
+        if not getattr(item, "enabled", True):
+            continue
+        if obj is None or obj.type != "MESH":
+            continue
+        garments.append(obj)
+    # Keep stable order based on list order.
+    return garments
+
+
 def _iter_garment_meshes_from_collection(coll):
     if coll is None:
         return []
@@ -57,13 +70,98 @@ def _validate_assigned_meshes(settings):
     if body_obj is None or not is_mesh_object(body_obj):
         return None
 
-    garments = _iter_garment_meshes_from_collection(settings.garment_collection)
-    if not garments and settings.garment_object is not None and is_mesh_object(settings.garment_object):
+    garments = _garments_from_list(settings)
+    if not garments:
+        # Backwards-compatible fallback: legacy collection/object fields.
+        garments = _iter_garment_meshes_from_collection(getattr(settings, "garment_collection", None))
+    if not garments and getattr(settings, "garment_object", None) is not None and is_mesh_object(settings.garment_object):
         garments = [settings.garment_object]
 
     if not garments:
         return None
     return body_obj, garments
+
+
+class CG_OT_add_selected_garments(Operator):
+    bl_idname = "cloth_guard.add_selected_garments"
+    bl_label = "Add Selected Garment"
+    bl_description = "Add selected mesh objects to the garment list (ignores non-mesh; avoids duplicates)"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        settings = _settings(context)
+        body_obj = settings.body_object
+
+        selected_meshes = [o for o in context.selected_objects if o.type == "MESH"]
+        if body_obj is not None:
+            selected_meshes = [o for o in selected_meshes if o != body_obj]
+
+        if not selected_meshes:
+            self.report({"WARNING"}, "Select one or more garment mesh objects to add")
+            return {"CANCELLED"}
+
+        existing = {item.object for item in settings.garments if item.object is not None}
+        added = 0
+        for obj in selected_meshes:
+            if obj in existing:
+                continue
+            item = settings.garments.add()
+            item.object = obj
+            item.enabled = True
+            existing.add(obj)
+            added += 1
+
+        if added == 0:
+            self.report({"INFO"}, "No new garments added (already in list)")
+            return {"CANCELLED"}
+
+        settings.active_garment_index = max(0, len(settings.garments) - 1)
+        self.report({"INFO"}, f"Added {added} garment(s)")
+        return {"FINISHED"}
+
+
+class CG_OT_remove_active_garment(Operator):
+    bl_idname = "cloth_guard.remove_active_garment"
+    bl_label = "Remove Garment"
+    bl_description = "Remove the active garment entry from the garment list"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        settings = _settings(context)
+        idx = int(settings.active_garment_index)
+        if idx < 0 or idx >= len(settings.garments):
+            self.report({"WARNING"}, "No garment entry selected")
+            return {"CANCELLED"}
+        settings.garments.remove(idx)
+        settings.active_garment_index = max(0, min(idx, len(settings.garments) - 1))
+        return {"FINISHED"}
+
+
+class CG_OT_move_garment(Operator):
+    bl_idname = "cloth_guard.move_garment"
+    bl_label = "Move Garment"
+    bl_description = "Move the active garment up/down in the list"
+    bl_options = {"REGISTER", "UNDO"}
+
+    direction: bpy.props.EnumProperty(
+        items=(("UP", "Up", ""), ("DOWN", "Down", "")),
+        default="UP",
+    )
+
+    def execute(self, context):
+        settings = _settings(context)
+        idx = int(settings.active_garment_index)
+        if idx < 0 or idx >= len(settings.garments):
+            return {"CANCELLED"}
+        if self.direction == "UP":
+            new_idx = idx - 1
+        else:
+            new_idx = idx + 1
+        if new_idx < 0 or new_idx >= len(settings.garments):
+            return {"CANCELLED"}
+        settings.garments.move(idx, new_idx)
+        settings.active_garment_index = new_idx
+        return {"FINISHED"}
 
 
 class CG_OT_setup(Operator):
@@ -78,14 +176,14 @@ class CG_OT_setup(Operator):
         if settings is None:
             return False
         return settings.body_object is not None and (
-            settings.garment_collection is not None or settings.garment_object is not None
+            len(getattr(settings, "garments", [])) > 0 or settings.garment_object is not None or settings.garment_collection is not None
         )
 
     def execute(self, context):
         settings = _settings(context)
         validated = _validate_assigned_meshes(settings)
         if validated is None:
-            self.report({"ERROR"}, "Assign a valid Body mesh and a Garment Collection (or legacy Garment Object) first")
+            self.report({"ERROR"}, "Assign a valid Body mesh and add garment mesh objects to the Garments list first")
             return {"CANCELLED"}
         body_obj, garments = validated
 
@@ -126,7 +224,7 @@ class CG_OT_remove_setup(Operator):
         settings = _settings(context)
         validated = _validate_assigned_meshes(settings)
         if validated is None:
-            self.report({"ERROR"}, "Assign a valid Body mesh and a Garment Collection (or legacy Garment Object) first")
+            self.report({"ERROR"}, "Assign a valid Body mesh and add garment mesh objects to the Garments list first")
             return {"CANCELLED"}
         body_obj, garments = validated
 
@@ -161,7 +259,7 @@ class CG_OT_create_body_mask(Operator):
         settings = _settings(context)
         validated = _validate_assigned_meshes(settings)
         if validated is None:
-            self.report({"ERROR"}, "Assign a valid Body mesh and a Garment Collection (or legacy Garment Object) first")
+            self.report({"ERROR"}, "Assign a valid Body mesh and add garment mesh objects to the Garments list first")
             return {"CANCELLED"}
         body_obj, garments = validated
 
@@ -244,7 +342,7 @@ class CG_OT_detect_clipping(Operator):
         settings = _settings(context)
         validated = _validate_assigned_meshes(settings)
         if validated is None:
-            self.report({"ERROR"}, "Assign a valid Body mesh and a Garment Collection (or legacy Garment Object) first")
+            self.report({"ERROR"}, "Assign a valid Body mesh and add garment mesh objects to the Garments list first")
             return {"CANCELLED"}
         body_obj, garments = validated
 
@@ -310,13 +408,13 @@ class CG_OT_select_clipping_vertices(Operator):
         settings = _settings(context)
         validated = _validate_assigned_meshes(settings)
         if validated is None:
-            self.report({"ERROR"}, "Assign a valid Body mesh and a Garment Collection (or legacy Garment Object) first")
+            self.report({"ERROR"}, "Assign a valid Body mesh and add garment mesh objects to the Garments list first")
             return {"CANCELLED"}
         _, garments = validated
 
         garment_obj = context.view_layer.objects.active
         if garment_obj is None or garment_obj.type != "MESH" or garment_obj not in garments:
-            self.report({"ERROR"}, "Make a garment mesh (from the Garment Collection) the active object, then run Select")
+            self.report({"ERROR"}, "Make a garment mesh from the Garments list the active object, then run Select")
             return {"CANCELLED"}
 
         vg = garment_obj.vertex_groups.get(CG_VG_CLIPPING)
@@ -365,7 +463,7 @@ class CG_OT_correct_current_pose(Operator):
         settings = _settings(context)
         validated = _validate_assigned_meshes(settings)
         if validated is None:
-            self.report({"ERROR"}, "Assign a valid Body mesh and a Garment Collection (or legacy Garment Object) first")
+            self.report({"ERROR"}, "Assign a valid Body mesh and add garment mesh objects to the Garments list first")
             return {"CANCELLED"}
         body_obj, garments = validated
 
@@ -446,7 +544,7 @@ class CG_OT_refresh_live_correction(Operator):
         settings = _settings(context)
         validated = _validate_assigned_meshes(settings)
         if validated is None:
-            self.report({"ERROR"}, "Assign a valid Body mesh and a Garment Collection (or legacy Garment Object) first")
+            self.report({"ERROR"}, "Assign a valid Body mesh and add garment mesh objects to the Garments list first")
             return {"CANCELLED"}
         body_obj, garments = validated
 
@@ -490,13 +588,13 @@ class CG_OT_create_corrective_shapekey(Operator):
         settings = _settings(context)
         validated = _validate_assigned_meshes(settings)
         if validated is None:
-            self.report({"ERROR"}, "Assign a valid Body mesh and a Garment Collection (or legacy Garment Object) first")
+            self.report({"ERROR"}, "Assign a valid Body mesh and add garment mesh objects to the Garments list first")
             return {"CANCELLED"}
         _, garments = validated
 
         garment_obj = context.view_layer.objects.active
         if garment_obj is None or garment_obj.type != "MESH" or garment_obj not in garments:
-            self.report({"ERROR"}, "Make a garment mesh (from the Garment Collection) the active object to bake a corrective")
+            self.report({"ERROR"}, "Make a garment mesh from the Garments list the active object to bake a corrective")
             return {"CANCELLED"}
 
         # Ensure live correction exists and is enabled so baking includes it.

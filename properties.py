@@ -19,6 +19,7 @@ from __future__ import annotations
 import bpy
 from bpy.props import (
     BoolProperty,
+    CollectionProperty,
     EnumProperty,
     FloatProperty,
     IntProperty,
@@ -39,6 +40,21 @@ def _poll_armature_object(self, obj: Object | None) -> bool:
     return obj is not None and obj.type == "ARMATURE"
 
 
+class CG_GarmentItem(PropertyGroup):
+    object: PointerProperty(
+        name="Garment",
+        type=Object,
+        poll=_poll_mesh_object,
+        description="Garment mesh object to process",
+    )
+
+    enabled: BoolProperty(
+        name="Enabled",
+        description="Enable processing for this garment",
+        default=True,
+    )
+
+
 class CG_Settings(PropertyGroup):
     body_object: PointerProperty(
         name="Body Object",
@@ -47,18 +63,31 @@ class CG_Settings(PropertyGroup):
         description="Character body mesh (used for masking and proximity checks)",
     )
 
-    garment_collection: PointerProperty(
-        name="Garment Collection",
-        type=Collection,
-        description="Collection containing garment mesh objects to process (shirts/jackets/pants/etc.)",
+    garments: CollectionProperty(
+        name="Garments",
+        type=CG_GarmentItem,
+        description="List of garment mesh objects to process",
     )
 
-    # Legacy single-garment support (kept for older .blend files; UI prefers garment_collection).
+    active_garment_index: IntProperty(
+        name="Active Garment Index",
+        default=0,
+        min=0,
+    )
+
+    # Legacy multi-garment support (kept for older .blend files; UI prefers garment list).
+    garment_collection: PointerProperty(
+        name="Garment Collection (Legacy)",
+        type=Collection,
+        description="Legacy collection-based garment assignment (use Garments list instead)",
+    )
+
+    # Legacy single-garment support (kept for older .blend files; UI prefers garment list).
     garment_object: PointerProperty(
         name="Garment Object (Legacy)",
         type=Object,
         poll=_poll_mesh_object,
-        description="Legacy single garment mesh (use Garment Collection for production workflows)",
+        description="Legacy single garment mesh (use Garments list instead)",
     )
 
     enable_live_anti_clip: BoolProperty(
