@@ -64,4 +64,3 @@ def unregister():
     unregister_properties()
     for cls in reversed(CLASSES):
         bpy.utils.unregister_class(cls)
-
