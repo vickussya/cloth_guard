@@ -502,8 +502,8 @@ def _update_correction_weights(context, *, report_to: Operator | None = None) ->
 
 class CG_OT_correct_current_pose(Operator):
     bl_idname = "cloth_guard.correct_current_pose"
-    bl_label = "Correct Current Pose"
-    bl_description = "Detect proximity/penetration against the body and write a live corrective shape key for the current pose (non-simulation)"
+    bl_label = "Update Live Corrective"
+    bl_description = "Non-destructive: update the CG_LiveCorrection shape key for the current pose (Basis is never modified)"
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
@@ -582,6 +582,40 @@ class CG_OT_correct_current_pose(Operator):
             print("[Cloth Guard][Correct]", msg)
             self.report({"INFO"}, msg)
 
+        return {"FINISHED"}
+
+
+class CG_OT_clear_live_correction(Operator):
+    bl_idname = "cloth_guard.clear_live_correction"
+    bl_label = "Clear Live Correction"
+    bl_description = "Non-destructive: reset CG_LiveCorrection to match Basis (removes the live correction effect)"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        settings = _settings(context)
+        validated = _validate_assigned_meshes(settings)
+        if validated is None:
+            self.report({"ERROR"}, "Assign a valid Body mesh and add garment mesh objects to the Garments list first")
+            return {"CANCELLED"}
+        _, garments = validated
+
+        with _temporary_mode_object(context):
+            cleared = 0
+            for garment_obj in garments:
+                if garment_obj.type != "MESH":
+                    continue
+                try:
+                    kb = ensure_live_correction_shapekey(garment_obj)
+                    basis = garment_obj.data.shape_keys.key_blocks[0]
+                    if len(kb.data) != len(basis.data):
+                        raise RuntimeError("Shape key vertex count mismatch")
+                    for i in range(len(basis.data)):
+                        kb.data[i].co = basis.data[i].co
+                    cleared += 1
+                except Exception as e:
+                    self.report({"WARNING"}, f"{garment_obj.name}: failed to clear live correction: {e}")
+
+            self.report({"INFO"}, f"Cleared CG_LiveCorrection on {cleared} garment(s) (Basis unchanged)")
         return {"FINISHED"}
 
 

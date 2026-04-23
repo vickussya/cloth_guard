@@ -81,9 +81,10 @@ class CG_PT_main(Panel):
         row = box.row(align=True)
         row.operator("cloth_guard.detect_clipping", text="Detect Clipping")
         row.operator("cloth_guard.select_clipping_vertices", text="Select")
-        row.operator("cloth_guard.correct_current_pose", text="Correct Current Pose")
+        row.operator("cloth_guard.correct_current_pose", text="Update Live Corrective")
         box.prop(settings, "enable_live_anti_clip", toggle=True)
         box.operator("cloth_guard.refresh_live_correction", text="Refresh Live Correction")
+        box.operator("cloth_guard.clear_live_correction", text="Clear Live Correction")
 
         box = layout.box()
         box.label(text="Body Mask")
