@@ -55,7 +55,7 @@ class CG_Settings(PropertyGroup):
 
     enable_live_anti_clip: BoolProperty(
         name="Enable Live Anti-Clip",
-        description="Enable/disable Cloth Guard's anti-clip modifier stack on the garment (refresh weights as needed)",
+        description="Enable/disable Cloth Guard's live correction shape key on the garment (refresh as needed)",
         default=False,
         update=lambda self, context: cg_update_modifier_visibility(context),
     )
@@ -63,7 +63,7 @@ class CG_Settings(PropertyGroup):
     offset_distance: FloatProperty(
         name="Offset Distance",
         description="Target minimum offset distance from the body surface",
-        default=0.003,
+        default=0.005,
         min=0.0,
         soft_max=0.05,
         subtype="DISTANCE",
@@ -92,7 +92,7 @@ class CG_Settings(PropertyGroup):
     max_push_distance: FloatProperty(
         name="Max Push Distance",
         description="Safety limit (MVP uses it as a detection cap; future versions may use it for explicit push limits)",
-        default=0.05,
+        default=0.03,
         min=0.0,
         soft_max=0.5,
         subtype="DISTANCE",

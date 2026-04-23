@@ -20,17 +20,17 @@ import bpy
 from bpy.types import Operator
 
 from .utils import (
-    CG_MOD_ANTICLIP,
     CG_MOD_BODY_MASK,
-    CG_MOD_SMOOTH,
     CG_VG_BODY_MASK,
     CG_VG_CLIPPING,
+    CG_SHAPEKEY_LIVE,
     add_shapekey_driver_rotation_range,
     build_bvh,
     clear_vertex_group,
-    compute_proximity_weights,
-    ensure_anticlip_modifiers,
+    correct_current_pose,
+    detect_clipping,
     ensure_body_mask_modifier,
+    ensure_live_correction_shapekey,
     ensure_vertex_group,
     is_mesh_object,
     write_weights_to_vertex_group,
@@ -54,7 +54,7 @@ def _validate_assigned_meshes(settings):
 class CG_OT_setup(Operator):
     bl_idname = "cloth_guard.setup"
     bl_label = "Setup Cloth Guard"
-    bl_description = "Validate objects and prepare Cloth Guard data structures (vertex groups/modifiers)"
+    bl_description = "Validate objects and prepare Cloth Guard data structures (vertex groups/body mask/live correction)"
     bl_options = {"REGISTER", "UNDO"}
 
     @classmethod
@@ -86,21 +86,12 @@ class CG_OT_setup(Operator):
             if garment_obj.vertex_groups.get(name) is None:
                 garment_obj.vertex_groups.new(name=name)
 
-        # Prepare modifiers (visibility controlled by live toggle).
         ensure_body_mask_modifier(body_obj)
-        ensure_anticlip_modifiers(
-            garment_obj,
-            body_obj,
-            offset_distance=settings.offset_distance,
-            smooth_iterations=settings.smooth_iterations,
-            smooth_strength=settings.smooth_strength,
-        )
-
-        for mod_name in (CG_MOD_ANTICLIP, CG_MOD_SMOOTH):
-            mod = garment_obj.modifiers.get(mod_name)
-            if mod is not None:
-                mod.show_viewport = bool(settings.enable_live_anti_clip)
-                mod.show_render = bool(settings.enable_live_anti_clip)
+        ensure_live_correction_shapekey(garment_obj)
+        if garment_obj.data.shape_keys is not None:
+            kb = garment_obj.data.shape_keys.key_blocks.get(CG_SHAPEKEY_LIVE)
+            if kb is not None:
+                kb.value = 1.0 if settings.enable_live_anti_clip else 0.0
 
         self.report({"INFO"}, "Cloth Guard setup complete")
         return {"FINISHED"}
@@ -127,13 +118,14 @@ class CG_OT_remove_setup(Operator):
         if vg is not None:
             body_obj.vertex_groups.remove(vg)
 
-        for mod_name in (CG_MOD_SMOOTH, CG_MOD_ANTICLIP):
-            mod = garment_obj.modifiers.get(mod_name)
-            if mod is not None:
-                garment_obj.modifiers.remove(mod)
         vg = garment_obj.vertex_groups.get(CG_VG_CLIPPING)
         if vg is not None:
             garment_obj.vertex_groups.remove(vg)
+
+        if garment_obj.data.shape_keys is not None:
+            kb = garment_obj.data.shape_keys.key_blocks.get(CG_SHAPEKEY_LIVE)
+            if kb is not None:
+                garment_obj.shape_key_remove(kb)
 
         self.report({"INFO"}, "Cloth Guard setup removed")
         return {"FINISHED"}
@@ -205,56 +197,103 @@ class CG_OT_detect_clipping(Operator):
         body_obj, garment_obj = validated
 
         depsgraph = context.evaluated_depsgraph_get()
-        res = compute_proximity_weights(
-            garment_obj=garment_obj,
-            body_obj=body_obj,
-            depsgraph=depsgraph,
-            offset_distance=settings.offset_distance,
-            detection_radius=max(settings.offset_distance, settings.detection_radius),
-            correction_strength=1.0,
-            use_risk_area=settings.use_risk_area,
-            preserve_pinned_areas=False,
-        )
-        hard = [1.0 if w > 0.0 else 0.0 for w in res.weights]
+        try:
+            res = detect_clipping(
+                garment_obj=garment_obj,
+                body_obj=body_obj,
+                depsgraph=depsgraph,
+                offset_distance=settings.offset_distance,
+                detection_radius=max(settings.offset_distance, settings.detection_radius),
+                use_risk_area=settings.use_risk_area,
+            )
+        except Exception as e:
+            self.report({"ERROR"}, str(e))
+            return {"CANCELLED"}
+
+        hard = [0.0] * len(garment_obj.data.vertices)
+        for i in res.clipping_indices:
+            hard[i] = 1.0
         affected = write_weights_to_vertex_group(garment_obj, CG_VG_CLIPPING, hard)
-        self.report({"INFO"}, f"Clipping detected ({affected} vertices)")
+
+        s = res.stats
+        min_d = s.min_nearest_distance
+        avg_d = s.avg_flagged_distance
+        min_txt = f"{min_d:.6f} m" if min_d is not None else "n/a"
+        avg_txt = f"{avg_d:.6f} m" if avg_d is not None else "n/a"
+
+        if affected > 0:
+            msg = (
+                f"Checked {s.checked_verts} garment verts; {s.candidates_within_radius} within radius; "
+                f"{affected} flagged as clipping; min distance {min_txt}; avg flagged {avg_txt}"
+            )
+        else:
+            if s.candidates_within_radius > 0:
+                msg = (
+                    f"No clipping under current threshold; checked {s.checked_verts} verts; "
+                    f"{s.candidates_within_radius} within radius; min distance {min_txt}"
+                )
+            else:
+                msg = f"Checked {s.checked_verts} garment verts; min distance {min_txt}"
+
+        print("[Cloth Guard][Detect]", msg)
+        self.report({"INFO"}, msg)
+        return {"FINISHED"}
+
+
+class CG_OT_select_clipping_vertices(Operator):
+    bl_idname = "cloth_guard.select_clipping_vertices"
+    bl_label = "Select Clipping Vertices"
+    bl_description = "Select vertices flagged in the CG_Clipping vertex group (Edit Mode)"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        settings = _settings(context)
+        validated = _validate_assigned_meshes(settings)
+        if validated is None:
+            self.report({"ERROR"}, "Assign valid Body and Garment mesh objects first")
+            return {"CANCELLED"}
+        _, garment_obj = validated
+
+        vg = garment_obj.vertex_groups.get(CG_VG_CLIPPING)
+        if vg is None:
+            self.report({"ERROR"}, f"Missing vertex group: {CG_VG_CLIPPING}")
+            return {"CANCELLED"}
+
+        view_layer = context.view_layer
+        prev_active = view_layer.objects.active
+        view_layer.objects.active = garment_obj
+        garment_obj.select_set(True)
+        try:
+            if garment_obj.mode != "EDIT":
+                bpy.ops.object.mode_set(mode="EDIT")
+
+            import bmesh
+
+            bm = bmesh.from_edit_mesh(garment_obj.data)
+            mesh = garment_obj.data
+            group_index = vg.index
+            for v in bm.verts:
+                v.select_set(False)
+                for g in mesh.vertices[v.index].groups:
+                    if g.group == group_index and g.weight > 0.0:
+                        v.select_set(True)
+                        break
+            bmesh.update_edit_mesh(garment_obj.data, loop_triangles=False, destructive=False)
+        finally:
+            view_layer.objects.active = prev_active
+
+        self.report({"INFO"}, f"Selected {CG_VG_CLIPPING} vertices")
         return {"FINISHED"}
 
 
 def _update_correction_weights(context, *, report_to: Operator | None = None) -> int:
-    settings = _settings(context)
-    validated = _validate_assigned_meshes(settings)
-    if validated is None:
-        if report_to:
-            report_to.report({"ERROR"}, "Assign valid Body and Garment mesh objects first")
-        return -1
-    body_obj, garment_obj = validated
-
-    depsgraph = context.evaluated_depsgraph_get()
-    detection_radius = max(float(settings.detection_radius), float(settings.offset_distance))
-    if settings.max_push_distance > 0.0:
-        detection_radius = min(detection_radius, float(settings.max_push_distance))
-
-    res = compute_proximity_weights(
-        garment_obj=garment_obj,
-        body_obj=body_obj,
-        depsgraph=depsgraph,
-        offset_distance=float(settings.offset_distance),
-        detection_radius=float(detection_radius),
-        correction_strength=float(settings.correction_strength),
-        use_risk_area=bool(settings.use_risk_area),
-        preserve_pinned_areas=bool(settings.preserve_pinned_areas),
-    )
-    affected = write_weights_to_vertex_group(garment_obj, CG_VG_CLIPPING, res.weights)
-    if report_to:
-        report_to.report({"INFO"}, f"Updated correction weights ({affected} vertices)")
-    return affected
+    return 0
 
 
 class CG_OT_correct_current_pose(Operator):
     bl_idname = "cloth_guard.correct_current_pose"
     bl_label = "Correct Current Pose"
-    bl_description = "Update proximity weights and configure the anti-clip modifier stack (non-simulation)"
+    bl_description = "Detect proximity/penetration against the body and write a live corrective shape key for the current pose (non-simulation)"
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
@@ -265,27 +304,57 @@ class CG_OT_correct_current_pose(Operator):
             return {"CANCELLED"}
         body_obj, garment_obj = validated
 
-        affected = _update_correction_weights(context, report_to=self)
-        if affected < 0:
+        depsgraph = context.evaluated_depsgraph_get()
+
+        # Update clipping group + gather debug stats.
+        try:
+            det = detect_clipping(
+                garment_obj=garment_obj,
+                body_obj=body_obj,
+                depsgraph=depsgraph,
+                offset_distance=settings.offset_distance,
+                detection_radius=max(settings.offset_distance, settings.detection_radius),
+                use_risk_area=settings.use_risk_area,
+            )
+        except Exception as e:
+            self.report({"ERROR"}, str(e))
             return {"CANCELLED"}
 
-        ensure_anticlip_modifiers(
-            garment_obj,
-            body_obj,
-            offset_distance=settings.offset_distance,
-            smooth_iterations=settings.smooth_iterations,
-            smooth_strength=settings.smooth_strength,
+        hard = [0.0] * len(garment_obj.data.vertices)
+        for i in det.clipping_indices:
+            hard[i] = 1.0
+        write_weights_to_vertex_group(garment_obj, CG_VG_CLIPPING, hard)
+
+        # Apply correction based on evaluated geometry.
+        try:
+            stats = correct_current_pose(
+                garment_obj=garment_obj,
+                body_obj=body_obj,
+                depsgraph=depsgraph,
+                offset_distance=settings.offset_distance,
+                detection_radius=max(settings.offset_distance, settings.detection_radius),
+                correction_strength=settings.correction_strength,
+                max_push_distance=settings.max_push_distance,
+                smooth_iterations=settings.smooth_iterations,
+                smooth_strength=settings.smooth_strength,
+                use_risk_area=settings.use_risk_area,
+                preserve_pinned_areas=settings.preserve_pinned_areas,
+            )
+        except Exception as e:
+            self.report({"ERROR"}, str(e))
+            return {"CANCELLED"}
+
+        settings.enable_live_anti_clip = True
+
+        s = det.stats
+        min_d = s.min_nearest_distance
+        min_txt = f"{min_d:.6f} m" if min_d is not None else "n/a"
+        msg = (
+            f"Checked {s.checked_verts} verts; {s.candidates_within_radius} within radius; "
+            f"{s.flagged_clipping} flagged; corrected {stats.corrected_verts}; min distance {min_txt}"
         )
-
-        # If the user explicitly runs a correction, make it visible.
-        if not settings.enable_live_anti_clip:
-            settings.enable_live_anti_clip = True
-
-        for mod_name in (CG_MOD_ANTICLIP, CG_MOD_SMOOTH):
-            mod = garment_obj.modifiers.get(mod_name)
-            if mod is not None:
-                mod.show_viewport = bool(settings.enable_live_anti_clip)
-                mod.show_render = bool(settings.enable_live_anti_clip)
+        print("[Cloth Guard][Correct]", msg)
+        self.report({"INFO"}, msg)
 
         return {"FINISHED"}
 
@@ -297,9 +366,35 @@ class CG_OT_refresh_live_correction(Operator):
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
-        affected = _update_correction_weights(context, report_to=self)
-        if affected < 0:
+        settings = _settings(context)
+        validated = _validate_assigned_meshes(settings)
+        if validated is None:
+            self.report({"ERROR"}, "Assign valid Body and Garment mesh objects first")
             return {"CANCELLED"}
+        body_obj, garment_obj = validated
+
+        depsgraph = context.evaluated_depsgraph_get()
+        try:
+            stats = correct_current_pose(
+                garment_obj=garment_obj,
+                body_obj=body_obj,
+                depsgraph=depsgraph,
+                offset_distance=settings.offset_distance,
+                detection_radius=max(settings.offset_distance, settings.detection_radius),
+                correction_strength=settings.correction_strength,
+                max_push_distance=settings.max_push_distance,
+                smooth_iterations=settings.smooth_iterations,
+                smooth_strength=settings.smooth_strength,
+                use_risk_area=settings.use_risk_area,
+                preserve_pinned_areas=settings.preserve_pinned_areas,
+            )
+        except Exception as e:
+            self.report({"ERROR"}, str(e))
+            return {"CANCELLED"}
+
+        min_d = stats.min_nearest_distance
+        min_txt = f"{min_d:.6f} m" if min_d is not None else "n/a"
+        self.report({"INFO"}, f"Refreshed live correction (corrected {stats.corrected_verts}; min distance {min_txt})")
         return {"FINISHED"}
 
 
@@ -317,48 +412,26 @@ class CG_OT_create_corrective_shapekey(Operator):
             return {"CANCELLED"}
         body_obj, garment_obj = validated
 
-        _update_correction_weights(context)
-        ensure_anticlip_modifiers(
-            garment_obj,
-            body_obj,
-            offset_distance=settings.offset_distance,
-            smooth_iterations=settings.smooth_iterations,
-            smooth_strength=settings.smooth_strength,
-        )
-
-        mod_to_apply = garment_obj.modifiers.get(CG_MOD_SMOOTH) or garment_obj.modifiers.get(CG_MOD_ANTICLIP)
-        if mod_to_apply is None:
-            self.report({"ERROR"}, "No anti-clip modifier found; run Setup/Correct first")
-            return {"CANCELLED"}
+        # Ensure live correction exists and is enabled so baking includes it.
+        ensure_live_correction_shapekey(garment_obj)
+        settings.enable_live_anti_clip = True
 
         view_layer = context.view_layer
         prev_active = view_layer.objects.active
         view_layer.objects.active = garment_obj
         garment_obj.select_set(True)
 
-        prev_keys = 0
-        if garment_obj.data.shape_keys is not None:
-            prev_keys = len(garment_obj.data.shape_keys.key_blocks)
-
         try:
-            bpy.ops.object.modifier_apply_as_shapekey(modifier=mod_to_apply.name, keep_modifier=True)
+            new_key = garment_obj.shape_key_add(
+                name=(settings.corrective_name.strip() or "CG_Corrective"),
+                from_mix=True,
+            )
         except Exception as e:
             self.report({"ERROR"}, f"Failed to bake corrective shape key: {e}")
             return {"CANCELLED"}
         finally:
             view_layer.objects.active = prev_active
 
-        if garment_obj.data.shape_keys is None:
-            self.report({"ERROR"}, "Shape key bake did not create shape keys")
-            return {"CANCELLED"}
-
-        kb = garment_obj.data.shape_keys.key_blocks
-        if len(kb) <= prev_keys:
-            self.report({"ERROR"}, "Shape key bake did not create a new key block")
-            return {"CANCELLED"}
-
-        new_key = kb[-1]
-        new_key.name = settings.corrective_name.strip() or "CG_Corrective"
         new_key.value = 1.0
 
         if settings.driver_enable:

@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from typing import Iterable, Optional
 
 import bpy
+from mathutils import Vector
 from mathutils.bvhtree import BVHTree
 
 CG_VG_BODY_MASK = "CG_BodyMask"
@@ -35,6 +36,8 @@ CG_VG_PRESERVE_SEAMS = "CG_Preserve_Seams"
 CG_MOD_BODY_MASK = "CG_BodyMask"
 CG_MOD_ANTICLIP = "CG_AntiClip"
 CG_MOD_SMOOTH = "CG_Smooth"
+
+CG_SHAPEKEY_LIVE = "CG_LiveCorrection"
 
 
 def is_mesh_object(obj) -> bool:
@@ -86,6 +89,340 @@ def build_bvh(obj_eval: bpy.types.Object, depsgraph) -> BVHTree:
 class ProximityWeightsResult:
     weights: list[float]
     affected_count: int
+
+
+@dataclass(frozen=True)
+class ClipDetectionStats:
+    checked_verts: int
+    candidates_within_radius: int
+    flagged_clipping: int
+    min_nearest_distance: float | None
+    avg_flagged_distance: float | None
+
+
+@dataclass(frozen=True)
+class ClipDetectionResult:
+    stats: ClipDetectionStats
+    clipping_indices: list[int]
+    candidate_indices: list[int]
+    nearest_distances: list[float | None]
+
+
+def _safe_min(values: Iterable[float | None]) -> float | None:
+    vals = [v for v in values if v is not None]
+    return min(vals) if vals else None
+
+
+def _safe_avg(values: Iterable[float | None]) -> float | None:
+    vals = [v for v in values if v is not None]
+    return (sum(vals) / len(vals)) if vals else None
+
+
+def _ensure_shape_keys(obj: bpy.types.Object) -> bpy.types.Key:
+    if obj.data.shape_keys is None:
+        obj.shape_key_add(name="Basis", from_mix=False)
+    return obj.data.shape_keys
+
+
+def ensure_live_correction_shapekey(garment_obj: bpy.types.Object) -> bpy.types.ShapeKey:
+    keys = _ensure_shape_keys(garment_obj)
+    kb = keys.key_blocks.get(CG_SHAPEKEY_LIVE)
+    if kb is None:
+        kb = garment_obj.shape_key_add(name=CG_SHAPEKEY_LIVE, from_mix=False)
+    return kb
+
+
+def _build_vertex_adjacency(mesh: bpy.types.Mesh) -> list[list[int]]:
+    adj: list[list[int]] = [[] for _ in range(len(mesh.vertices))]
+    for e in mesh.edges:
+        a = int(e.vertices[0])
+        b = int(e.vertices[1])
+        adj[a].append(b)
+        adj[b].append(a)
+    return adj
+
+
+def _smooth_deltas(
+    *,
+    deltas: list[Vector],
+    adjacency: list[list[int]],
+    iterations: int,
+    strength: float,
+) -> list[Vector]:
+    if iterations <= 0 or strength <= 0.0:
+        return deltas
+    strength = max(0.0, min(1.0, float(strength)))
+
+    cur = deltas
+    for _ in range(int(iterations)):
+        nxt = [v.copy() for v in cur]
+        for i, nbrs in enumerate(adjacency):
+            if not nbrs:
+                continue
+            avg = Vector((0.0, 0.0, 0.0))
+            for j in nbrs:
+                avg += cur[j]
+            avg /= float(len(nbrs))
+            nxt[i] = cur[i].lerp(avg, strength)
+        cur = nxt
+    return cur
+
+
+def detect_clipping(
+    *,
+    garment_obj: bpy.types.Object,
+    body_obj: bpy.types.Object,
+    depsgraph,
+    offset_distance: float,
+    detection_radius: float,
+    use_risk_area: bool,
+) -> ClipDetectionResult:
+    """
+    Robust MVP clipping detection on evaluated (deformed) meshes:
+    - Proximity candidates via nearest surface distance (world space)
+    - Penetration heuristic using nearest surface normal (dot < 0)
+    - Face overlap heuristic via BVH overlap (catches face intersections even if no vertex is inside)
+    """
+    offset_distance = max(0.0, float(offset_distance))
+    detection_radius = max(offset_distance, float(detection_radius))
+
+    garment_eval = garment_obj.evaluated_get(depsgraph)
+    body_eval = body_obj.evaluated_get(depsgraph)
+
+    bvh_body = build_bvh(body_eval, depsgraph)
+    bvh_garment = build_bvh(garment_eval, depsgraph)
+
+    mesh_eval = garment_eval.to_mesh()
+    try:
+        base_mesh = garment_obj.data
+        if len(mesh_eval.vertices) != len(base_mesh.vertices):
+            raise RuntimeError(
+                "Garment evaluated mesh vertex count differs from base mesh. "
+                "Disable topology-changing modifiers (Subdivision, Remesh, etc.) for detection."
+            )
+
+        g_mw = garment_eval.matrix_world
+        risk_idx = _vertex_group_index(garment_obj, CG_VG_RISK) if use_risk_area else None
+
+        # When normals are noisy or inconsistent, require a small negative dot to call it penetration.
+        penetration_eps = max(1e-6, offset_distance * 0.05)
+
+        nearest_distances: list[float | None] = [None] * len(mesh_eval.vertices)
+        candidate_indices: list[int] = []
+        clipping_set: set[int] = set()
+
+        checked = 0
+        candidates = 0
+
+        for i, v in enumerate(mesh_eval.vertices):
+            if risk_idx is not None:
+                if _vertex_weight(base_mesh.vertices[i], risk_idx) <= 0.0:
+                    continue
+
+            checked += 1
+            world_co = g_mw @ v.co
+            nearest = bvh_body.find_nearest(world_co)
+            if nearest is None:
+                continue
+
+            nearest_co, nearest_no, _, dist = nearest
+            if dist is None:
+                dist = (world_co - nearest_co).length
+            nearest_distances[i] = float(dist)
+
+            if dist <= detection_radius:
+                candidates += 1
+                candidate_indices.append(i)
+
+                is_clipping = dist <= offset_distance
+                if not is_clipping and nearest_no is not None:
+                    vec = world_co - nearest_co
+                    # dot < 0 means vertex lies "inside" the body if body normals point outward.
+                    if vec.dot(nearest_no) < -penetration_eps:
+                        is_clipping = True
+
+                if is_clipping:
+                    clipping_set.add(i)
+
+        # Face overlap heuristic.
+        overlaps = bvh_body.overlap(bvh_garment)
+        if overlaps:
+            mesh_eval.calc_loop_triangles()
+            for _, g_poly_idx in overlaps:
+                g_idx = int(g_poly_idx)
+                poly = None
+                if g_idx < len(mesh_eval.polygons):
+                    poly = mesh_eval.polygons[g_idx]
+                elif g_idx < len(mesh_eval.loop_triangles):
+                    poly_i = mesh_eval.loop_triangles[g_idx].polygon_index
+                    if poly_i < len(mesh_eval.polygons):
+                        poly = mesh_eval.polygons[poly_i]
+                if poly is None:
+                    continue
+                for vi in poly.vertices:
+                    idx = int(vi)
+                    if risk_idx is not None and _vertex_weight(base_mesh.vertices[idx], risk_idx) <= 0.0:
+                        continue
+                    clipping_set.add(idx)
+
+        clipping_indices = sorted(clipping_set)
+        flagged_dists = [nearest_distances[i] for i in clipping_indices]
+        stats = ClipDetectionStats(
+            checked_verts=checked,
+            candidates_within_radius=candidates,
+            flagged_clipping=len(clipping_indices),
+            min_nearest_distance=_safe_min(nearest_distances),
+            avg_flagged_distance=_safe_avg(flagged_dists),
+        )
+        return ClipDetectionResult(
+            stats=stats,
+            clipping_indices=clipping_indices,
+            candidate_indices=candidate_indices,
+            nearest_distances=nearest_distances,
+        )
+    finally:
+        garment_eval.to_mesh_clear()
+
+
+@dataclass(frozen=True)
+class PoseCorrectionStats:
+    checked_verts: int
+    corrected_verts: int
+    min_nearest_distance: float | None
+
+
+def correct_current_pose(
+    *,
+    garment_obj: bpy.types.Object,
+    body_obj: bpy.types.Object,
+    depsgraph,
+    offset_distance: float,
+    detection_radius: float,
+    correction_strength: float,
+    max_push_distance: float,
+    smooth_iterations: int,
+    smooth_strength: float,
+    use_risk_area: bool,
+    preserve_pinned_areas: bool,
+) -> PoseCorrectionStats:
+    offset_distance = max(0.0, float(offset_distance))
+    detection_radius = max(offset_distance, float(detection_radius))
+    correction_strength = max(0.0, min(1.0, float(correction_strength)))
+    max_push_distance = max(0.0, float(max_push_distance))
+
+    garment_eval = garment_obj.evaluated_get(depsgraph)
+    body_eval = body_obj.evaluated_get(depsgraph)
+    bvh_body = build_bvh(body_eval, depsgraph)
+
+    mesh_eval = garment_eval.to_mesh()
+    try:
+        base_mesh = garment_obj.data
+        if len(mesh_eval.vertices) != len(base_mesh.vertices):
+            raise RuntimeError(
+                "Garment evaluated mesh vertex count differs from base mesh. "
+                "Disable topology-changing modifiers for correction."
+            )
+
+        g_mw = garment_eval.matrix_world
+        inv_mw = garment_obj.matrix_world.inverted_safe()
+
+        risk_idx = _vertex_group_index(garment_obj, CG_VG_RISK) if use_risk_area else None
+        pinned_idx = _vertex_group_index(garment_obj, CG_VG_PINNED) if preserve_pinned_areas else None
+        collar_idx = _vertex_group_index(garment_obj, CG_VG_PRESERVE_COLLAR)
+        hem_idx = _vertex_group_index(garment_obj, CG_VG_PRESERVE_HEM)
+        seams_idx = _vertex_group_index(garment_obj, CG_VG_PRESERVE_SEAMS)
+
+        preserve_scale = 0.5
+        penetration_eps = max(1e-6, offset_distance * 0.05)
+
+        deltas: list[Vector] = [Vector((0.0, 0.0, 0.0)) for _ in range(len(mesh_eval.vertices))]
+        checked = 0
+        corrected = 0
+        nearest_distances: list[float | None] = [None] * len(mesh_eval.vertices)
+
+        for i, v in enumerate(mesh_eval.vertices):
+            if risk_idx is not None and _vertex_weight(base_mesh.vertices[i], risk_idx) <= 0.0:
+                continue
+
+            checked += 1
+            world_co = g_mw @ v.co
+            nearest = bvh_body.find_nearest(world_co)
+            if nearest is None:
+                continue
+            nearest_co, nearest_no, _, dist = nearest
+            if dist is None:
+                dist = (world_co - nearest_co).length
+            dist = float(dist)
+            nearest_distances[i] = dist
+
+            if dist > detection_radius and dist > offset_distance:
+                continue
+
+            vec = world_co - nearest_co
+            dot = vec.dot(nearest_no) if nearest_no is not None else vec.length
+            inside = nearest_no is not None and dot < -penetration_eps
+
+            if inside:
+                push_amount = offset_distance + (-dot)
+                push_dir = nearest_no
+            else:
+                if dist >= offset_distance:
+                    continue
+                push_amount = offset_distance - dist
+                push_dir = vec.normalized() if vec.length > 1e-12 else (nearest_no if nearest_no is not None else Vector((0.0, 0.0, 1.0)))
+
+            if max_push_distance > 0.0:
+                push_amount = min(push_amount, max_push_distance)
+
+            push_amount *= correction_strength
+            if push_amount <= 0.0:
+                continue
+
+            # Group-based attenuation.
+            scale = 1.0
+            if pinned_idx is not None:
+                pinned_w = _vertex_weight(base_mesh.vertices[i], pinned_idx)
+                if pinned_w > 0.0:
+                    scale *= max(0.0, 1.0 - pinned_w)
+
+            preserve_w = 0.0
+            if collar_idx is not None:
+                preserve_w = max(preserve_w, _vertex_weight(base_mesh.vertices[i], collar_idx))
+            if hem_idx is not None:
+                preserve_w = max(preserve_w, _vertex_weight(base_mesh.vertices[i], hem_idx))
+            if seams_idx is not None:
+                preserve_w = max(preserve_w, _vertex_weight(base_mesh.vertices[i], seams_idx))
+            if preserve_w > 0.0:
+                scale *= max(0.0, 1.0 - preserve_w * preserve_scale)
+
+            if scale <= 0.0:
+                continue
+
+            world_delta = push_dir.normalized() * (push_amount * scale)
+            local_delta = inv_mw.to_3x3() @ world_delta
+            deltas[i] = local_delta
+            corrected += 1
+
+        # Smooth deltas over the garment topology.
+        deltas = _smooth_deltas(
+            deltas=deltas,
+            adjacency=_build_vertex_adjacency(base_mesh),
+            iterations=int(smooth_iterations),
+            strength=float(smooth_strength),
+        )
+
+        live = ensure_live_correction_shapekey(garment_obj)
+        basis = garment_obj.data.shape_keys.key_blocks[0]
+        for i in range(len(base_mesh.vertices)):
+            live.data[i].co = basis.data[i].co + deltas[i]
+
+        return PoseCorrectionStats(
+            checked_verts=checked,
+            corrected_verts=corrected,
+            min_nearest_distance=_safe_min(nearest_distances),
+        )
+    finally:
+        garment_eval.to_mesh_clear()
 
 
 def compute_proximity_weights(
@@ -264,6 +601,10 @@ def cg_update_modifier_visibility(context) -> None:
         return
 
     enabled = bool(settings.enable_live_anti_clip)
+    if garment_obj.data.shape_keys is not None:
+        kb = garment_obj.data.shape_keys.key_blocks.get(CG_SHAPEKEY_LIVE)
+        if kb is not None:
+            kb.value = 1.0 if enabled else 0.0
     for mod_name in (CG_MOD_ANTICLIP, CG_MOD_SMOOTH):
         mod = garment_obj.modifiers.get(mod_name)
         if mod is None:

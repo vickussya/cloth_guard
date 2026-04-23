@@ -44,6 +44,7 @@ class CG_PT_main(Panel):
         box.label(text="Detection / Correction")
         row = box.row(align=True)
         row.operator("cloth_guard.detect_clipping", text="Detect Clipping")
+        row.operator("cloth_guard.select_clipping_vertices", text="Select")
         row.operator("cloth_guard.correct_current_pose", text="Correct Current Pose")
         box.prop(settings, "enable_live_anti_clip", toggle=True)
         box.operator("cloth_guard.refresh_live_correction", text="Refresh Live Correction")
