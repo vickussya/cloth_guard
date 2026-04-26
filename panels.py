@@ -136,7 +136,9 @@ class CG_PT_main(Panel):
 
         box = layout.box()
         box.label(text="Body Mask")
-        box.operator("cloth_guard.create_body_mask", text="Create Body Mask")
+        row = box.row(align=True)
+        row.operator("cloth_guard.create_body_mask", text="Create Body Mask")
+        row.operator("cloth_guard.delete_body_mask", text="Delete Body Mask")
 
         box = layout.box()
         box.label(text="Correctives")
@@ -164,6 +166,10 @@ class CG_PT_main(Panel):
         col.prop(settings, "detection_radius")
         col.prop(settings, "correction_strength")
         col.prop(settings, "max_push_distance")
+        col.separator()
+        col.prop(settings, "correction_passes")
+        col.prop(settings, "safety_margin")
+        col.prop(settings, "push_multiplier")
         col.separator()
         col.prop(settings, "smooth_iterations")
         col.prop(settings, "smooth_strength")

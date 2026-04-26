@@ -226,6 +226,33 @@ class CG_Settings(PropertyGroup):
         subtype="FACTOR",
     )
 
+    correction_passes: IntProperty(
+        name="Correction Passes",
+        description="Number of gentle correction passes to run (more passes can remove residual clipping without a single aggressive deformation)",
+        default=2,
+        min=1,
+        max=5,
+    )
+
+    safety_margin: FloatProperty(
+        name="Safety Margin",
+        description="Extra margin added to Offset Distance during correction (helps reduce residual clipping)",
+        default=0.001,
+        min=0.0,
+        soft_max=0.02,
+        subtype="DISTANCE",
+        unit="LENGTH",
+    )
+
+    push_multiplier: FloatProperty(
+        name="Push Multiplier",
+        description="Multiplier on correction strength (kept controlled; higher values push a bit more per pass)",
+        default=1.0,
+        min=0.0,
+        max=3.0,
+        subtype="FACTOR",
+    )
+
     mask_distance: FloatProperty(
         name="Mask Distance",
         description="Distance threshold for hiding body parts under the garment",

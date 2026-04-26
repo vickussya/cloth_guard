@@ -426,6 +426,7 @@ def correct_current_pose(
     smooth_strength: float,
     use_risk_area: bool,
     preserve_pinned_areas: bool,
+    accumulate: bool = False,
 ) -> PoseCorrectionStats:
     offset_distance = max(0.0, float(offset_distance))
     detection_radius = max(offset_distance, float(detection_radius))
@@ -581,8 +582,9 @@ def correct_current_pose(
 
         live = ensure_live_correction_shapekey(garment_obj)
         basis = garment_obj.data.shape_keys.key_blocks[0]
+        base_kb = live if accumulate else basis
         for i in range(len(base_mesh.vertices)):
-            live.data[i].co = basis.data[i].co + deltas[i]
+            live.data[i].co = base_kb.data[i].co + deltas[i]
         live.value = 1.0
 
         return PoseCorrectionStats(

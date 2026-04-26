@@ -156,11 +156,20 @@ def _run_detection_and_weights(
     garment_obj: bpy.types.Object,
     body_obj: bpy.types.Object,
     depsgraph,
+    offset_distance: float | None = None,
+    detection_radius: float | None = None,
 ) -> tuple[object, int, int]:
     """
     Detect and write CG_Contact/CG_Clipping weights safely, using cage mode if enabled.
     Returns (detection_result, contact_affected, clipping_affected).
     """
+    if offset_distance is None:
+        offset_distance = float(settings.offset_distance)
+    if detection_radius is None:
+        detection_radius = float(settings.detection_radius)
+    offset_distance = max(0.0, float(offset_distance))
+    detection_radius = max(offset_distance, float(detection_radius))
+
     mismatch = _topology_mismatch(garment_obj=garment_obj, depsgraph=depsgraph)
     # If topology differs, weight mapping to the base mesh is only reliable in cage mode,
     # so we force cage mode for detection regardless of the UI toggle.
@@ -177,8 +186,8 @@ def _run_detection_and_weights(
             garment_obj=garment_obj,
             body_obj=body_obj,
             depsgraph=depsgraph,
-            offset_distance=settings.offset_distance,
-            detection_radius=max(settings.offset_distance, settings.detection_radius),
+            offset_distance=offset_distance,
+            detection_radius=detection_radius,
             use_risk_area=settings.use_risk_area,
         )
 
@@ -189,6 +198,86 @@ def _run_detection_and_weights(
 
 def _topology_mismatch(*, garment_obj: bpy.types.Object, depsgraph) -> bool:
     return _base_vertex_count(garment_obj) != _eval_vertex_count(garment_obj, depsgraph)
+
+
+def _run_shape_key_passes(
+    *,
+    context,
+    settings,
+    garment_obj: bpy.types.Object,
+    body_obj: bpy.types.Object,
+    depsgraph,
+) -> tuple[object, object, int]:
+    """
+    Run multi-pass shape-key correction.
+
+    Returns: (det_before, det_after, passes_used)
+    """
+    passes = int(getattr(settings, "correction_passes", 1))
+    passes = max(1, min(5, passes))
+
+    target_offset = max(0.0, float(settings.offset_distance + settings.safety_margin))
+    det_before, contact_affected, clipping_affected = _run_detection_and_weights(
+        context=context,
+        settings=settings,
+        garment_obj=garment_obj,
+        body_obj=body_obj,
+        depsgraph=depsgraph,
+        offset_distance=target_offset,
+        detection_radius=max(target_offset, settings.detection_radius),
+    )
+
+    # If nothing is clipping, we can skip heavy work.
+    if int(det_before.stats.flagged_clipping) <= 0:
+        return det_before, det_before, 0
+
+    strength = float(settings.correction_strength) * float(settings.push_multiplier)
+    strength = max(0.0, min(1.0, strength))
+
+    for p in range(passes):
+        stats = correct_current_pose(
+            garment_obj=garment_obj,
+            body_obj=body_obj,
+            depsgraph=depsgraph,
+            offset_distance=target_offset,
+            detection_radius=max(target_offset, settings.detection_radius),
+            correction_strength=strength,
+            max_push_distance=settings.max_push_distance,
+            smooth_iterations=settings.smooth_iterations,
+            smooth_strength=settings.smooth_strength,
+            use_risk_area=settings.use_risk_area,
+            preserve_pinned_areas=settings.preserve_pinned_areas,
+            accumulate=(p > 0),
+        )
+
+        # Re-evaluate to let the depsgraph see the updated shapekey.
+        context.view_layer.update()
+        depsgraph = context.evaluated_depsgraph_get()
+
+        det_after, _, _ = _run_detection_and_weights(
+            context=context,
+            settings=settings,
+            garment_obj=garment_obj,
+            body_obj=body_obj,
+            depsgraph=depsgraph,
+            offset_distance=target_offset,
+            detection_radius=max(target_offset, settings.detection_radius),
+        )
+
+        print(
+            "[Cloth Guard][Pass]",
+            garment_obj.name,
+            f"pass={p+1}/{passes}",
+            f"before={int(det_before.stats.flagged_clipping)}",
+            f"after={int(det_after.stats.flagged_clipping)}",
+            f"changed={stats.changed_verts}",
+            f"max_delta={stats.max_delta_distance:.6f} m",
+        )
+
+        if int(det_after.stats.flagged_clipping) <= 0:
+            return det_before, det_after, p + 1
+
+    return det_before, det_after, passes
 
 
 class CG_OT_check_garment_compatibility(Operator):
@@ -517,9 +606,9 @@ class CG_OT_create_body_mask(Operator):
 
         # Vertex group writes require object mode.
         with _temporary_mode_object(context):
-            return self._execute_object_mode(context, body_obj, garments)
+            return self._execute_object_mode(context, settings, body_obj, garments)
 
-    def _execute_object_mode(self, context, body_obj, garments):
+    def _execute_object_mode(self, context, settings, body_obj, garments):
         depsgraph = context.evaluated_depsgraph_get()
         body_eval = body_obj.evaluated_get(depsgraph)
 
@@ -589,6 +678,46 @@ class CG_OT_create_body_mask(Operator):
         return {"FINISHED"}
 
 
+class CG_OT_delete_body_mask(Operator):
+    bl_idname = "cloth_guard.delete_body_mask"
+    bl_label = "Delete Body Mask"
+    bl_description = "Remove Cloth Guard's body mask vertex group and Mask modifier (restores body visibility)"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        settings = _settings(context)
+        body_obj = settings.body_object
+        if body_obj is None or not is_mesh_object(body_obj):
+            self.report({"ERROR"}, "Assign a valid Body mesh first")
+            return {"CANCELLED"}
+
+        with _temporary_mode_object(context):
+            removed_mod = False
+            removed_vg = False
+
+            mod = body_obj.modifiers.get(CG_MOD_BODY_MASK)
+            if mod is not None and getattr(mod, "type", None) == "MASK":
+                body_obj.modifiers.remove(mod)
+                removed_mod = True
+
+            vg = body_obj.vertex_groups.get(CG_VG_BODY_MASK)
+            if vg is not None:
+                body_obj.vertex_groups.remove(vg)
+                removed_vg = True
+
+        if not removed_mod and not removed_vg:
+            self.report({"INFO"}, "No Cloth Guard body mask found to delete")
+            return {"CANCELLED"}
+
+        parts = []
+        if removed_vg:
+            parts.append("vertex group")
+        if removed_mod:
+            parts.append("Mask modifier")
+        self.report({"INFO"}, f"Deleted body mask ({' + '.join(parts)})")
+        return {"FINISHED"}
+
+
 class CG_OT_detect_clipping(Operator):
     bl_idname = "cloth_guard.detect_clipping"
     bl_label = "Detect Clipping"
@@ -619,6 +748,8 @@ class CG_OT_detect_clipping(Operator):
                         garment_obj=garment_obj,
                         body_obj=body_obj,
                         depsgraph=depsgraph,
+                        offset_distance=max(0.0, float(settings.offset_distance + settings.safety_margin)),
+                        detection_radius=max(float(settings.offset_distance + settings.safety_margin), settings.detection_radius),
                     )
                 except Exception as e:
                     self.report({"WARNING"}, f"{garment_obj.name}: {e}")
@@ -737,12 +868,15 @@ class CG_OT_correct_current_pose(Operator):
 
             for garment_obj in garments:
                 try:
+                    target_offset = max(0.0, float(settings.offset_distance + settings.safety_margin))
                     det, contact_affected, clipping_affected = _run_detection_and_weights(
                         context=context,
                         settings=settings,
                         garment_obj=garment_obj,
                         body_obj=body_obj,
                         depsgraph=depsgraph,
+                        offset_distance=target_offset,
+                        detection_radius=max(target_offset, settings.detection_radius),
                     )
                 except Exception as e:
                     self.report({"WARNING"}, f"{garment_obj.name}: {e}")
@@ -753,12 +887,14 @@ class CG_OT_correct_current_pose(Operator):
                 # - Topology changing: set up helper modifiers and refresh weights (non-destructive)
                 is_mismatch = _topology_mismatch(garment_obj=garment_obj, depsgraph=depsgraph)
 
+                before_clipping = int(det.stats.flagged_clipping)
+
                 if is_mismatch:
                     try:
                         ensure_anticlip_modifiers(
                             garment_obj=garment_obj,
                             body_obj=body_obj,
-                            offset_distance=settings.offset_distance,
+                            offset_distance=target_offset,
                             smooth_iterations=settings.smooth_iterations,
                             smooth_strength=settings.smooth_strength,
                         )
@@ -777,49 +913,57 @@ class CG_OT_correct_current_pose(Operator):
                             {"INFO"},
                             f"{garment_obj.name}: topology-changing modifiers detected; using helper/modifier correction mode. {_NON_DESTRUCTIVE_MSG}",
                         )
+                        # Residual check (still in cage mode so mapping stays stable).
+                        context.view_layer.update()
+                        depsgraph = context.evaluated_depsgraph_get()
+                        det_after, _, _ = _run_detection_and_weights(
+                            context=context,
+                            settings=settings,
+                            garment_obj=garment_obj,
+                            body_obj=body_obj,
+                            depsgraph=depsgraph,
+                            offset_distance=target_offset,
+                            detection_radius=max(target_offset, settings.detection_radius),
+                        )
+                        after_clipping = int(det_after.stats.flagged_clipping)
+                        self.report(
+                            {"INFO"},
+                            f"{garment_obj.name}: {before_clipping} clipping before, {after_clipping} remaining (helper mode)",
+                        )
                     except Exception as e:
                         self.report({"ERROR"}, f"{garment_obj.name}: helper/modifier correction failed: {e}")
                     continue
 
                 try:
-                    stats = correct_current_pose(
+                    det_before, det_after, used = _run_shape_key_passes(
+                        context=context,
+                        settings=settings,
                         garment_obj=garment_obj,
                         body_obj=body_obj,
                         depsgraph=depsgraph,
-                        offset_distance=settings.offset_distance,
-                        detection_radius=max(settings.offset_distance, settings.detection_radius),
-                        correction_strength=settings.correction_strength,
-                        max_push_distance=settings.max_push_distance,
-                        smooth_iterations=settings.smooth_iterations,
-                        smooth_strength=settings.smooth_strength,
-                        use_risk_area=settings.use_risk_area,
-                        preserve_pinned_areas=settings.preserve_pinned_areas,
+                    )
+                    after_clipping = int(det_after.stats.flagged_clipping)
+                    self.report(
+                        {"INFO"},
+                        f"{garment_obj.name}: {before_clipping} clipping before, {after_clipping} remaining after {used} pass(es).",
                     )
                 except Exception as e:
                     self.report({"ERROR"}, f"{garment_obj.name}: correction failed: {e}")
                     continue
 
+                # Update global summary using before detection stats (stable) and after for min.
                 s = det.stats
                 total_checked += s.checked_verts
                 total_candidates += s.candidates_within_radius
                 total_contact += contact_affected
                 total_clipping += clipping_affected
-                total_corrected += stats.corrected_verts
-                if s.min_nearest_distance is not None:
+                total_corrected += int(before_clipping - after_clipping) if before_clipping >= after_clipping else 0
+                if det_after.stats.min_nearest_distance is not None:
                     global_min = (
-                        s.min_nearest_distance
+                        det_after.stats.min_nearest_distance
                         if global_min is None
-                        else min(global_min, s.min_nearest_distance)
+                        else min(global_min, det_after.stats.min_nearest_distance)
                     )
-                print(
-                    "[Cloth Guard][Correct]",
-                    garment_obj.name,
-                    f"frame={context.scene.frame_current}",
-                    f"clipping={int(s.flagged_clipping)}",
-                    f"corrected={stats.corrected_verts}",
-                    f"changed={stats.changed_verts}",
-                    f"max_delta={stats.max_delta_distance:.6f} m",
-                )
 
             settings.enable_live_anti_clip = True
             global_min_txt = f"{global_min:.6f} m" if global_min is not None else "n/a"
@@ -915,6 +1059,8 @@ class CG_OT_scan_animation(Operator):
                             garment_obj=garment_obj,
                             body_obj=body_obj,
                             depsgraph=depsgraph,
+                            offset_distance=max(0.0, float(settings.offset_distance + settings.safety_margin)),
+                            detection_radius=max(float(settings.offset_distance + settings.safety_margin), settings.detection_radius),
                         )
                     except Exception as e:
                         details_parts.append(f"{garment_obj.name}:ERR")
@@ -1068,12 +1214,15 @@ class CG_OT_generate_correction_current_frame(Operator):
         with _temporary_mode_object(context):
             for garment_obj in garments:
                 try:
+                    target_offset = max(0.0, float(settings.offset_distance + settings.safety_margin))
                     det, _, clipping_affected = _run_detection_and_weights(
                         context=context,
                         settings=settings,
                         garment_obj=garment_obj,
                         body_obj=body_obj,
                         depsgraph=depsgraph,
+                        offset_distance=target_offset,
+                        detection_radius=max(target_offset, settings.detection_radius),
                     )
 
                     # Topology mismatch: bake as helper/modifier strength keyframes instead of shape keys.
@@ -1081,7 +1230,7 @@ class CG_OT_generate_correction_current_frame(Operator):
                         ensure_anticlip_modifiers(
                             garment_obj=garment_obj,
                             body_obj=body_obj,
-                            offset_distance=settings.offset_distance,
+                            offset_distance=target_offset,
                             smooth_iterations=settings.smooth_iterations,
                             smooth_strength=settings.smooth_strength,
                         )
@@ -1099,20 +1248,15 @@ class CG_OT_generate_correction_current_frame(Operator):
                         )
                         continue
 
-                    stats = correct_current_pose(
+                    det_before, det_after, used = _run_shape_key_passes(
+                        context=context,
+                        settings=settings,
                         garment_obj=garment_obj,
                         body_obj=body_obj,
                         depsgraph=depsgraph,
-                        offset_distance=settings.offset_distance,
-                        detection_radius=max(settings.offset_distance, settings.detection_radius),
-                        correction_strength=settings.correction_strength,
-                        max_push_distance=settings.max_push_distance,
-                        smooth_iterations=settings.smooth_iterations,
-                        smooth_strength=settings.smooth_strength,
-                        use_risk_area=settings.use_risk_area,
-                        preserve_pinned_areas=settings.preserve_pinned_areas,
                     )
-                    if stats.changed_verts <= 0 or stats.max_delta_distance <= 1e-10:
+                    changed_live, max_live = _shapekey_delta_stats(garment_obj=garment_obj, shapekey_name=CG_SHAPEKEY_LIVE)
+                    if changed_live <= 0 or max_live <= 1e-12:
                         self.report({"INFO"}, f"{garment_obj.name}: no correction delta generated at frame {frame}")
                         continue
                     view_layer.objects.active = garment_obj
@@ -1126,8 +1270,9 @@ class CG_OT_generate_correction_current_frame(Operator):
                         "[Cloth Guard][BakeFrame]",
                         garment_obj.name,
                         f"frame={frame}",
-                        f"clipping={int(det.stats.flagged_clipping)}",
-                        f"corrected={stats.corrected_verts}",
+                        f"before={int(det_before.stats.flagged_clipping)}",
+                        f"after={int(det_after.stats.flagged_clipping)}",
+                        f"passes={used}",
                         f"delta_verts={changed}",
                         f"max_delta={max_d:.6f}",
                         f"key={key_name}",
@@ -1177,19 +1322,22 @@ class CG_OT_generate_corrections_flagged_frames(Operator):
                     depsgraph = context.evaluated_depsgraph_get()
                     for garment_obj in garments:
                         try:
+                            target_offset = max(0.0, float(settings.offset_distance + settings.safety_margin))
                             det, _, clipping_affected = _run_detection_and_weights(
                                 context=context,
                                 settings=settings,
                                 garment_obj=garment_obj,
                                 body_obj=body_obj,
                                 depsgraph=depsgraph,
+                                offset_distance=target_offset,
+                                detection_radius=max(target_offset, settings.detection_radius),
                             )
 
                             if _topology_mismatch(garment_obj=garment_obj, depsgraph=depsgraph):
                                 ensure_anticlip_modifiers(
                                     garment_obj=garment_obj,
                                     body_obj=body_obj,
-                                    offset_distance=settings.offset_distance,
+                                    offset_distance=target_offset,
                                     smooth_iterations=settings.smooth_iterations,
                                     smooth_strength=settings.smooth_strength,
                                 )
@@ -1207,20 +1355,15 @@ class CG_OT_generate_corrections_flagged_frames(Operator):
                                 )
                                 continue
 
-                            stats = correct_current_pose(
+                            det_before, det_after, used = _run_shape_key_passes(
+                                context=context,
+                                settings=settings,
                                 garment_obj=garment_obj,
                                 body_obj=body_obj,
                                 depsgraph=depsgraph,
-                                offset_distance=settings.offset_distance,
-                                detection_radius=max(settings.offset_distance, settings.detection_radius),
-                                correction_strength=settings.correction_strength,
-                                max_push_distance=settings.max_push_distance,
-                                smooth_iterations=settings.smooth_iterations,
-                                smooth_strength=settings.smooth_strength,
-                                use_risk_area=settings.use_risk_area,
-                                preserve_pinned_areas=settings.preserve_pinned_areas,
                             )
-                            if stats.changed_verts <= 0 or stats.max_delta_distance <= 1e-10:
+                            changed_live, max_live = _shapekey_delta_stats(garment_obj=garment_obj, shapekey_name=CG_SHAPEKEY_LIVE)
+                            if changed_live <= 0 or max_live <= 1e-12:
                                 print("[Cloth Guard][BakeFlagged]", garment_obj.name, f"frame={frame}", "NO_DELTA")
                                 continue
                             view_layer.objects.active = garment_obj
@@ -1234,8 +1377,9 @@ class CG_OT_generate_corrections_flagged_frames(Operator):
                                 "[Cloth Guard][BakeFlagged]",
                                 garment_obj.name,
                                 f"frame={frame}",
-                                f"clipping={int(det.stats.flagged_clipping)}",
-                                f"corrected={stats.corrected_verts}",
+                                f"before={int(det_before.stats.flagged_clipping)}",
+                                f"after={int(det_after.stats.flagged_clipping)}",
+                                f"passes={used}",
                                 f"delta_verts={changed}",
                                 f"max_delta={max_d:.6f}",
                                 f"key={key_name}",
@@ -1333,23 +1477,23 @@ class CG_OT_create_corrective_shapekey(Operator):
         with _temporary_mode_object(context):
             ensure_live_correction_shapekey(garment_obj)
             settings.enable_live_anti_clip = True
-            # Update live correction now so the baked corrective isn't empty.
             depsgraph = context.evaluated_depsgraph_get()
-            stats = correct_current_pose(
+            det_before, det_after, used = _run_shape_key_passes(
+                context=context,
+                settings=settings,
                 garment_obj=garment_obj,
                 body_obj=settings.body_object,
                 depsgraph=depsgraph,
-                offset_distance=settings.offset_distance,
-                detection_radius=max(settings.offset_distance, settings.detection_radius),
-                correction_strength=settings.correction_strength,
-                max_push_distance=settings.max_push_distance,
-                smooth_iterations=settings.smooth_iterations,
-                smooth_strength=settings.smooth_strength,
-                use_risk_area=settings.use_risk_area,
-                preserve_pinned_areas=settings.preserve_pinned_areas,
             )
-            if stats.changed_verts <= 0 or stats.max_delta_distance <= 1e-10:
+            changed_live, max_live = _shapekey_delta_stats(garment_obj=garment_obj, shapekey_name=CG_SHAPEKEY_LIVE)
+            if changed_live <= 0 or max_live <= 1e-12:
                 self.report({"WARNING"}, "No correction delta generated for this pose; corrective shape key may be empty")
+            else:
+                self.report(
+                    {"INFO"},
+                    f"Live corrective updated: {int(det_before.stats.flagged_clipping)} clipping before, "
+                    f"{int(det_after.stats.flagged_clipping)} remaining after {used} pass(es).",
+                )
 
         view_layer = context.view_layer
         prev_active = view_layer.objects.active
