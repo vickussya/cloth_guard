@@ -258,6 +258,12 @@ class CG_Settings(PropertyGroup):
         default=True,
     )
 
+    ignore_topology_modifiers: BoolProperty(
+        name="Use Cage Mode For Topology-Changing Garments",
+        description="When a garment has topology-changing modifiers (Subdivision/Geometry Nodes/etc.), Cloth Guard computes detection/corrections on a topology-stable cage (temporarily disabling those modifiers) and applies the result non-destructively through the live modifier stack",
+        default=True,
+    )
+
     corrective_name: StringProperty(
         name="Corrective Name",
         description="Name for the new corrective shape key",

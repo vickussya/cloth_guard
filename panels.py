@@ -87,6 +87,8 @@ class CG_PT_main(Panel):
         row.prop(settings, "scan_start_frame")
         row.prop(settings, "scan_end_frame")
         box.prop(settings, "scan_frame_step")
+        box.operator("cloth_guard.check_garment_compatibility", text="Check Garment Compatibility")
+        box.prop(settings, "ignore_topology_modifiers")
 
         row = box.row(align=True)
         row.operator("cloth_guard.scan_animation", text="Scan Animation")

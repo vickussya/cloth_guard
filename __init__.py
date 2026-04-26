@@ -29,6 +29,7 @@ import bpy
 from .operators import (
     CG_OT_add_selected_garments,
     CG_OT_bake_corrections,
+    CG_OT_check_garment_compatibility,
     CG_OT_clear_live_correction,
     CG_OT_correct_current_pose,
     CG_OT_create_body_mask,
@@ -71,6 +72,7 @@ CLASSES = (
     CG_OT_correct_current_pose,
     CG_OT_refresh_live_correction,
     CG_OT_clear_live_correction,
+    CG_OT_check_garment_compatibility,
     CG_OT_scan_animation,
     CG_OT_clear_problem_frames,
     CG_OT_go_to_problem_frame,

@@ -86,6 +86,9 @@ For extreme poses (raised arms, torso twists), automated anti-clip deformation m
 - It will not produce perfect collision in all scenarios (dense layering, extreme deformation, very thin offsets).
 - Extreme poses may still require manual corrective keys and/or careful weight painting of control groups.
 - Best results are typically achieved with stylized or art-directed garments where you want controlled shapes.
+- **Two correction modes**:
+  - **Shape-key correction** (best when topology is stable): used when evaluated vertex count matches the base mesh.
+  - **Helper/modifier correction** (for live modifier stacks): used automatically when topology-changing modifiers are present (Subdivision/Geometry Nodes/etc.). This keeps the stack non-destructive and animator-friendly.
 
 ## License
 

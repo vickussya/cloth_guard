@@ -23,6 +23,8 @@ from bpy.types import Operator
 
 from .utils import (
     CG_MOD_BODY_MASK,
+    CG_MOD_ANTICLIP,
+    CG_MOD_SMOOTH,
     CG_VG_BODY_MASK,
     CG_VG_CONTACT,
     CG_VG_CLIPPING,
@@ -32,6 +34,7 @@ from .utils import (
     clear_vertex_group,
     correct_current_pose,
     detect_clipping,
+    ensure_anticlip_modifiers,
     ensure_body_mask_modifier,
     ensure_live_correction_shapekey,
     ensure_vertex_group,
@@ -40,6 +43,196 @@ from .utils import (
 )
 
 # NOTE: Keep operator ids under the `cloth_guard.*` namespace (AGENTS.md).
+
+
+_TOPOLOGY_MODIFIER_TYPES = {
+    # Common topology-changing modifiers
+    "SUBSURF",
+    "REMESH",
+    "SKIN",
+    "BOOLEAN",
+    "DECIMATE",
+    "MULTIRES",
+    "SOLIDIFY",
+    "SCREW",
+    "ARRAY",
+    "MIRROR",
+    "NODES",  # Geometry Nodes can change topology
+    "DYNAMIC_PAINT",
+    "OCEAN",
+    "PARTICLE_SYSTEM",
+    "TRIANGULATE",
+    "WELD",
+}
+
+
+def _eval_vertex_count(obj: bpy.types.Object, depsgraph) -> int:
+    obj_eval = obj.evaluated_get(depsgraph)
+    me = obj_eval.to_mesh()
+    try:
+        return int(len(me.vertices))
+    finally:
+        obj_eval.to_mesh_clear()
+
+
+def _base_vertex_count(obj: bpy.types.Object) -> int:
+    me = getattr(obj, "data", None)
+    return int(len(me.vertices)) if me is not None else 0
+
+
+def _likely_topology_modifiers(obj: bpy.types.Object) -> list[bpy.types.Modifier]:
+    mods = []
+    for mod in obj.modifiers:
+        if not getattr(mod, "show_viewport", True):
+            continue
+        if mod.type in _TOPOLOGY_MODIFIER_TYPES:
+            mods.append(mod)
+    return mods
+
+
+@contextmanager
+def _temporarily_disable_modifiers(obj: bpy.types.Object, mods: list[bpy.types.Modifier]):
+    prev = []
+    try:
+        for mod in mods:
+            prev.append((mod, bool(mod.show_viewport), bool(mod.show_render)))
+            mod.show_viewport = False
+            mod.show_render = False
+        yield
+    finally:
+        for mod, sv, sr in prev:
+            try:
+                mod.show_viewport = sv
+                mod.show_render = sr
+            except Exception:
+                pass
+
+
+def _compatibility_report_line(
+    *, garment_obj: bpy.types.Object, base_count: int, eval_count: int, mods: list[bpy.types.Modifier]
+) -> str:
+    status = "OK" if base_count == eval_count else "NOT OK"
+    if mods:
+        mod_txt = "; ".join([f"{m.name}({m.type})" for m in mods])
+    else:
+        mod_txt = "None detected"
+    return f"{garment_obj.name}: base={base_count} eval={eval_count} => {status}; mods: {mod_txt}"
+
+
+def _get_or_create_anticlip_mod(garment_obj: bpy.types.Object) -> bpy.types.Modifier | None:
+    mod = garment_obj.modifiers.get(CG_MOD_ANTICLIP)
+    if mod is None:
+        return None
+    return mod
+
+
+def _keyframe_modifier_strength(*, garment_obj: bpy.types.Object, mod_name: str, frame: int, value: float) -> None:
+    mod = garment_obj.modifiers.get(mod_name)
+    if mod is None or not hasattr(mod, "strength"):
+        return
+    mod.strength = float(value)
+    try:
+        mod.keyframe_insert(data_path="strength", frame=int(frame))
+    except Exception:
+        return
+
+    ad = garment_obj.animation_data
+    if ad is None or ad.action is None:
+        return
+    data_path = f'modifiers["{mod.name}"].strength'
+    fc = ad.action.fcurves.find(data_path=data_path)
+    if fc is None:
+        return
+    for kp in fc.keyframe_points:
+        if int(round(kp.co.x)) == int(frame):
+            kp.interpolation = "CONSTANT"
+
+
+def _run_detection_and_weights(
+    *,
+    context,
+    settings,
+    garment_obj: bpy.types.Object,
+    body_obj: bpy.types.Object,
+    depsgraph,
+) -> tuple[object, int, int]:
+    """
+    Detect and write CG_Contact/CG_Clipping weights safely, using cage mode if enabled.
+    Returns (detection_result, contact_affected, clipping_affected).
+    """
+    mismatch = _topology_mismatch(garment_obj=garment_obj, depsgraph=depsgraph)
+    # If topology differs, weight mapping to the base mesh is only reliable in cage mode,
+    # so we force cage mode for detection regardless of the UI toggle.
+    if mismatch:
+        mods = _likely_topology_modifiers(garment_obj)
+    else:
+        mods = _likely_topology_modifiers(garment_obj) if settings.ignore_topology_modifiers else []
+
+    with _temporarily_disable_modifiers(garment_obj, mods):
+        if mods:
+            context.view_layer.update()
+            depsgraph = context.evaluated_depsgraph_get()
+        det = detect_clipping(
+            garment_obj=garment_obj,
+            body_obj=body_obj,
+            depsgraph=depsgraph,
+            offset_distance=settings.offset_distance,
+            detection_radius=max(settings.offset_distance, settings.detection_radius),
+            use_risk_area=settings.use_risk_area,
+        )
+
+    contact_affected = write_weights_to_vertex_group(garment_obj, CG_VG_CONTACT, det.contact_weights)
+    clipping_affected = write_weights_to_vertex_group(garment_obj, CG_VG_CLIPPING, det.clipping_weights)
+    return det, contact_affected, clipping_affected
+
+
+def _topology_mismatch(*, garment_obj: bpy.types.Object, depsgraph) -> bool:
+    return _base_vertex_count(garment_obj) != _eval_vertex_count(garment_obj, depsgraph)
+
+
+class CG_OT_check_garment_compatibility(Operator):
+    bl_idname = "cloth_guard.check_garment_compatibility"
+    bl_label = "Check Garment Compatibility"
+    bl_description = "Check whether garments can use shape-key correction, or will use helper/modifier mode (topology-changing stacks)"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        settings = _settings(context)
+        validated = _validate_assigned_meshes(settings)
+        if validated is None:
+            self.report({"ERROR"}, "Assign a valid Body mesh and add garment mesh objects to the Garments list first")
+            return {"CANCELLED"}
+        _, garments = validated
+
+        with _temporary_mode_object(context):
+            depsgraph = context.evaluated_depsgraph_get()
+            bad = 0
+            lines = []
+            for garment_obj in garments:
+                base_count = _base_vertex_count(garment_obj)
+                eval_count = _eval_vertex_count(garment_obj, depsgraph)
+                mods = _likely_topology_modifiers(garment_obj)
+                if base_count != eval_count:
+                    bad += 1
+                line = _compatibility_report_line(
+                    garment_obj=garment_obj,
+                    base_count=base_count,
+                    eval_count=eval_count,
+                    mods=mods,
+                )
+                lines.append(line)
+                print("[Cloth Guard][Compat]", line)
+
+            if bad > 0:
+                self.report(
+                    {"WARNING"},
+                    "Some garments have topology-changing modifiers (topology mismatch). "
+                    "Cloth Guard will use a non-destructive helper/modifier workflow for those garments. "
+                    "Enable 'Use Cage Mode For Topology-Changing Garments' for best results. See console for details.",
+                )
+            else:
+                self.report({"INFO"}, f"All garments OK for corrective shape keys ({len(garments)} checked). See console for details.")
+        return {"FINISHED"}
 
 
 def _settings(context):
@@ -418,20 +611,16 @@ class CG_OT_detect_clipping(Operator):
 
             for garment_obj in garments:
                 try:
-                    res = detect_clipping(
+                    res, contact_affected, clipping_affected = _run_detection_and_weights(
+                        context=context,
+                        settings=settings,
                         garment_obj=garment_obj,
                         body_obj=body_obj,
                         depsgraph=depsgraph,
-                        offset_distance=settings.offset_distance,
-                        detection_radius=max(settings.offset_distance, settings.detection_radius),
-                        use_risk_area=settings.use_risk_area,
                     )
                 except Exception as e:
                     self.report({"WARNING"}, f"{garment_obj.name}: {e}")
                     continue
-
-                contact_affected = write_weights_to_vertex_group(garment_obj, CG_VG_CONTACT, res.contact_weights)
-                clipping_affected = write_weights_to_vertex_group(garment_obj, CG_VG_CLIPPING, res.clipping_weights)
 
                 s = res.stats
                 total_checked += s.checked_verts
@@ -546,20 +735,49 @@ class CG_OT_correct_current_pose(Operator):
 
             for garment_obj in garments:
                 try:
-                    det = detect_clipping(
+                    det, contact_affected, clipping_affected = _run_detection_and_weights(
+                        context=context,
+                        settings=settings,
                         garment_obj=garment_obj,
                         body_obj=body_obj,
                         depsgraph=depsgraph,
-                        offset_distance=settings.offset_distance,
-                        detection_radius=max(settings.offset_distance, settings.detection_radius),
-                        use_risk_area=settings.use_risk_area,
                     )
                 except Exception as e:
                     self.report({"WARNING"}, f"{garment_obj.name}: {e}")
                     continue
 
-                contact_affected = write_weights_to_vertex_group(garment_obj, CG_VG_CONTACT, det.contact_weights)
-                clipping_affected = write_weights_to_vertex_group(garment_obj, CG_VG_CLIPPING, det.clipping_weights)
+                # Mode selection:
+                # - Topology stable: write CG_LiveCorrection (shape key)
+                # - Topology changing: set up helper modifiers and refresh weights (non-destructive)
+                is_mismatch = _topology_mismatch(garment_obj=garment_obj, depsgraph=depsgraph)
+
+                if is_mismatch:
+                    try:
+                        ensure_anticlip_modifiers(
+                            garment_obj=garment_obj,
+                            body_obj=body_obj,
+                            offset_distance=settings.offset_distance,
+                            smooth_iterations=settings.smooth_iterations,
+                            smooth_strength=settings.smooth_strength,
+                        )
+                        mod = garment_obj.modifiers.get(CG_MOD_ANTICLIP)
+                        if mod is not None and hasattr(mod, "strength"):
+                            mod.strength = 1.0
+                        total_corrected += int(clipping_affected)
+                        s = det.stats
+                        total_checked += s.checked_verts
+                        total_candidates += s.candidates_within_radius
+                        total_contact += contact_affected
+                        total_clipping += clipping_affected
+                        if s.min_nearest_distance is not None:
+                            global_min = s.min_nearest_distance if global_min is None else min(global_min, s.min_nearest_distance)
+                        self.report(
+                            {"INFO"},
+                            f"{garment_obj.name}: topology-changing modifiers detected; using helper/modifier correction mode",
+                        )
+                    except Exception as e:
+                        self.report({"ERROR"}, f"{garment_obj.name}: helper/modifier correction failed: {e}")
+                    continue
 
                 try:
                     stats = correct_current_pose(
@@ -576,7 +794,7 @@ class CG_OT_correct_current_pose(Operator):
                         preserve_pinned_areas=settings.preserve_pinned_areas,
                     )
                 except Exception as e:
-                    self.report({"WARNING"}, f"{garment_obj.name}: correction failed: {e}")
+                    self.report({"ERROR"}, f"{garment_obj.name}: correction failed: {e}")
                     continue
 
                 s = det.stats
@@ -689,13 +907,12 @@ class CG_OT_scan_animation(Operator):
 
                 for garment_obj in garments:
                     try:
-                        res = detect_clipping(
+                        res, _, _ = _run_detection_and_weights(
+                            context=context,
+                            settings=settings,
                             garment_obj=garment_obj,
                             body_obj=body_obj,
                             depsgraph=depsgraph,
-                            offset_distance=settings.offset_distance,
-                            detection_radius=max(settings.offset_distance, settings.detection_radius),
-                            use_risk_area=settings.use_risk_area,
                         )
                     except Exception as e:
                         details_parts.append(f"{garment_obj.name}:ERR")
@@ -849,14 +1066,37 @@ class CG_OT_generate_correction_current_frame(Operator):
         with _temporary_mode_object(context):
             for garment_obj in garments:
                 try:
-                    det = detect_clipping(
+                    det, _, clipping_affected = _run_detection_and_weights(
+                        context=context,
+                        settings=settings,
                         garment_obj=garment_obj,
                         body_obj=body_obj,
                         depsgraph=depsgraph,
-                        offset_distance=settings.offset_distance,
-                        detection_radius=max(settings.offset_distance, settings.detection_radius),
-                        use_risk_area=settings.use_risk_area,
                     )
+
+                    # Topology mismatch: bake as helper/modifier strength keyframes instead of shape keys.
+                    if _topology_mismatch(garment_obj=garment_obj, depsgraph=depsgraph):
+                        ensure_anticlip_modifiers(
+                            garment_obj=garment_obj,
+                            body_obj=body_obj,
+                            offset_distance=settings.offset_distance,
+                            smooth_iterations=settings.smooth_iterations,
+                            smooth_strength=settings.smooth_strength,
+                        )
+                        _keyframe_modifier_strength(garment_obj=garment_obj, mod_name=CG_MOD_ANTICLIP, frame=frame - 1, value=0.0)
+                        _keyframe_modifier_strength(garment_obj=garment_obj, mod_name=CG_MOD_ANTICLIP, frame=frame, value=1.0)
+                        _keyframe_modifier_strength(garment_obj=garment_obj, mod_name=CG_MOD_ANTICLIP, frame=frame + 1, value=0.0)
+                        baked += 1
+                        print(
+                            "[Cloth Guard][BakeFrame][Helper]",
+                            garment_obj.name,
+                            f"frame={frame}",
+                            f"clipping={int(det.stats.flagged_clipping)}",
+                            f"clipping_vg={clipping_affected}",
+                            f"mod={CG_MOD_ANTICLIP}",
+                        )
+                        continue
+
                     stats = correct_current_pose(
                         garment_obj=garment_obj,
                         body_obj=body_obj,
@@ -935,14 +1175,36 @@ class CG_OT_generate_corrections_flagged_frames(Operator):
                     depsgraph = context.evaluated_depsgraph_get()
                     for garment_obj in garments:
                         try:
-                            det = detect_clipping(
+                            det, _, clipping_affected = _run_detection_and_weights(
+                                context=context,
+                                settings=settings,
                                 garment_obj=garment_obj,
                                 body_obj=body_obj,
                                 depsgraph=depsgraph,
-                                offset_distance=settings.offset_distance,
-                                detection_radius=max(settings.offset_distance, settings.detection_radius),
-                                use_risk_area=settings.use_risk_area,
                             )
+
+                            if _topology_mismatch(garment_obj=garment_obj, depsgraph=depsgraph):
+                                ensure_anticlip_modifiers(
+                                    garment_obj=garment_obj,
+                                    body_obj=body_obj,
+                                    offset_distance=settings.offset_distance,
+                                    smooth_iterations=settings.smooth_iterations,
+                                    smooth_strength=settings.smooth_strength,
+                                )
+                                _keyframe_modifier_strength(garment_obj=garment_obj, mod_name=CG_MOD_ANTICLIP, frame=frame - 1, value=0.0)
+                                _keyframe_modifier_strength(garment_obj=garment_obj, mod_name=CG_MOD_ANTICLIP, frame=frame, value=1.0)
+                                _keyframe_modifier_strength(garment_obj=garment_obj, mod_name=CG_MOD_ANTICLIP, frame=frame + 1, value=0.0)
+                                baked_keys += 1
+                                print(
+                                    "[Cloth Guard][BakeFlagged][Helper]",
+                                    garment_obj.name,
+                                    f"frame={frame}",
+                                    f"clipping={int(det.stats.flagged_clipping)}",
+                                    f"clipping_vg={clipping_affected}",
+                                    f"mod={CG_MOD_ANTICLIP}",
+                                )
+                                continue
+
                             stats = correct_current_pose(
                                 garment_obj=garment_obj,
                                 body_obj=body_obj,
@@ -1054,6 +1316,15 @@ class CG_OT_create_corrective_shapekey(Operator):
         garment_obj = context.view_layer.objects.active
         if garment_obj is None or garment_obj.type != "MESH" or garment_obj not in garments:
             self.report({"ERROR"}, "Make a garment mesh from the Garments list the active object to bake a corrective")
+            return {"CANCELLED"}
+
+        depsgraph = context.evaluated_depsgraph_get()
+        if _topology_mismatch(garment_obj=garment_obj, depsgraph=depsgraph):
+            self.report(
+                {"INFO"},
+                f"{garment_obj.name}: shape-key corrective is not available with topology-changing modifiers; "
+                "use Generate Correction (Current) / Generate Corrections (All Flagged) which switches to helper/modifier mode.",
+            )
             return {"CANCELLED"}
 
         # Ensure live correction exists and is enabled so baking includes it.
