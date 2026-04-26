@@ -29,6 +29,9 @@ from .utils import (
     CG_VG_CONTACT,
     CG_VG_CLIPPING,
     CG_SHAPEKEY_LIVE,
+    CG_VG_SHAPE_DRIFT,
+    CG_SHAPEKEY_REST,
+    CG_SHAPEKEY_LIVE_PRESERVE,
     add_shapekey_driver_rotation_range,
     build_bvh,
     clear_vertex_group,
@@ -37,8 +40,13 @@ from .utils import (
     ensure_anticlip_modifiers,
     ensure_body_mask_modifier,
     ensure_live_correction_shapekey,
+    ensure_live_preserve_shapekey,
+    ensure_rest_shape_shapekey,
     ensure_vertex_group,
     is_mesh_object,
+    store_rest_shape,
+    analyze_shape_drift,
+    generate_shape_preservation,
     write_weights_to_vertex_group,
 )
 
@@ -715,6 +723,238 @@ class CG_OT_delete_body_mask(Operator):
         if removed_mod:
             parts.append("Mask modifier")
         self.report({"INFO"}, f"Deleted body mask ({' + '.join(parts)})")
+        return {"FINISHED"}
+
+
+class CG_OT_store_rest_shape(Operator):
+    bl_idname = "cloth_guard.store_rest_shape"
+    bl_label = "Store Rest Shape"
+    bl_description = "Store a clean reference garment shape (CG_RestShape) for shape preservation analysis/correctives"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        settings = _settings(context)
+        validated = _validate_assigned_meshes(settings)
+        if validated is None:
+            self.report({"ERROR"}, "Assign a valid Body mesh and add garment mesh objects to the Garments list first")
+            return {"CANCELLED"}
+        _, garments = validated
+
+        with _temporary_mode_object(context):
+            depsgraph = context.evaluated_depsgraph_get()
+            stored = 0
+            for garment_obj in garments:
+                try:
+                    # Store rest using a topology-stable cage evaluation if needed.
+                    mismatch = _topology_mismatch(garment_obj=garment_obj, depsgraph=depsgraph)
+                    mods = _likely_topology_modifiers(garment_obj) if mismatch else []
+                    with _temporarily_disable_modifiers(garment_obj, mods):
+                        if mods:
+                            context.view_layer.update()
+                            depsgraph = context.evaluated_depsgraph_get()
+                        ensure_rest_shape_shapekey(garment_obj)
+                        written = store_rest_shape(garment_obj=garment_obj, depsgraph=depsgraph)
+                    stored += 1
+                    print("[Cloth Guard][Rest]", garment_obj.name, f"written={written}")
+                except Exception as e:
+                    self.report({"WARNING"}, f"{garment_obj.name}: failed to store rest shape: {e}")
+
+            self.report({"INFO"}, f"Stored rest shape for {stored} garment(s) (non-destructive)")
+        return {"FINISHED"}
+
+
+class CG_OT_analyze_shape_drift(Operator):
+    bl_idname = "cloth_guard.analyze_shape_drift"
+    bl_label = "Analyze Shape Drift"
+    bl_description = "Analyze drift from stored rest shape and write a CG_ShapeDrift vertex group for visualization"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        settings = _settings(context)
+        validated = _validate_assigned_meshes(settings)
+        if validated is None:
+            self.report({"ERROR"}, "Assign a valid Body mesh and add garment mesh objects to the Garments list first")
+            return {"CANCELLED"}
+        _, garments = validated
+
+        with _temporary_mode_object(context):
+            depsgraph = context.evaluated_depsgraph_get()
+            analyzed = 0
+            for garment_obj in garments:
+                try:
+                    mismatch = _topology_mismatch(garment_obj=garment_obj, depsgraph=depsgraph)
+                    mods = _likely_topology_modifiers(garment_obj) if mismatch else []
+                    with _temporarily_disable_modifiers(garment_obj, mods):
+                        if mods:
+                            context.view_layer.update()
+                            depsgraph = context.evaluated_depsgraph_get()
+                        stats, weights = analyze_shape_drift(
+                            garment_obj=garment_obj,
+                            depsgraph=depsgraph,
+                            drift_threshold=settings.drift_threshold,
+                            protect_borders=settings.protect_borders,
+                        )
+                    write_weights_to_vertex_group(garment_obj, CG_VG_SHAPE_DRIFT, weights)
+                    analyzed += 1
+                    avg_txt = f"{stats.avg_flagged_drift:.6f} m" if stats.avg_flagged_drift is not None else "n/a"
+                    self.report(
+                        {"INFO"},
+                        f"{garment_obj.name}: drift flagged {stats.flagged_verts}/{stats.checked_verts}; max {stats.max_drift_distance:.6f} m; avg {avg_txt}",
+                    )
+                    print(
+                        "[Cloth Guard][Drift]",
+                        garment_obj.name,
+                        f"flagged={stats.flagged_verts}",
+                        f"max={stats.max_drift_distance:.6f}",
+                    )
+                except Exception as e:
+                    self.report({"WARNING"}, f"{garment_obj.name}: drift analysis failed: {e}")
+
+            if analyzed == 0:
+                self.report({"ERROR"}, "No garments analyzed. Store Rest Shape first.")
+                return {"CANCELLED"}
+        return {"FINISHED"}
+
+
+class CG_OT_generate_shape_preservation_current(Operator):
+    bl_idname = "cloth_guard.generate_shape_preservation_current"
+    bl_label = "Preserve Shape (Current Frame)"
+    bl_description = "Generate a non-destructive live shape preservation corrective (CG_LivePreserve) for the current frame"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        settings = _settings(context)
+        validated = _validate_assigned_meshes(settings)
+        if validated is None:
+            self.report({"ERROR"}, "Assign a valid Body mesh and add garment mesh objects to the Garments list first")
+            return {"CANCELLED"}
+        _, garments = validated
+
+        with _temporary_mode_object(context):
+            depsgraph = context.evaluated_depsgraph_get()
+            done = 0
+            for garment_obj in garments:
+                try:
+                    mismatch = _topology_mismatch(garment_obj=garment_obj, depsgraph=depsgraph)
+                    mods = _likely_topology_modifiers(garment_obj) if mismatch else []
+                    with _temporarily_disable_modifiers(garment_obj, mods):
+                        if mods:
+                            context.view_layer.update()
+                            depsgraph = context.evaluated_depsgraph_get()
+                        ensure_live_preserve_shapekey(garment_obj)
+                        changed, max_d = generate_shape_preservation(
+                            garment_obj=garment_obj,
+                            depsgraph=depsgraph,
+                            strength=settings.shape_strength,
+                            smoothing_iterations=settings.wrinkle_smoothing_iterations,
+                            smoothing_strength=settings.wrinkle_smoothing_strength,
+                            silhouette_preservation=settings.silhouette_preservation,
+                            protect_borders=settings.protect_borders,
+                            protect_groups=settings.protect_preserve_groups,
+                        )
+                    if changed <= 0:
+                        self.report({"INFO"}, f"{garment_obj.name}: no shape preservation delta generated")
+                        continue
+                    done += 1
+                    self.report({"INFO"}, f"{garment_obj.name}: preserve changed {changed} verts; max delta {max_d:.6f} m")
+                    print("[Cloth Guard][Preserve]", garment_obj.name, f"changed={changed}", f"max_delta={max_d:.6f}")
+                except Exception as e:
+                    self.report({"WARNING"}, f"{garment_obj.name}: shape preservation failed: {e}")
+
+            if done == 0:
+                self.report({"ERROR"}, "No preservation corrections generated. Store Rest Shape first.")
+                return {"CANCELLED"}
+
+            settings.enable_live_anti_clip = True
+        return {"FINISHED"}
+
+
+class CG_OT_generate_shape_preservation_flagged(Operator):
+    bl_idname = "cloth_guard.generate_shape_preservation_flagged"
+    bl_label = "Preserve Shape (All Flagged Frames)"
+    bl_description = "For each flagged frame, generate shape preservation and bake it (non-destructive)"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        settings = _settings(context)
+        validated = _validate_assigned_meshes(settings)
+        if validated is None:
+            self.report({"ERROR"}, "Assign a valid Body mesh and add garment mesh objects to the Garments list first")
+            return {"CANCELLED"}
+        _, garments = validated
+
+        if len(settings.problem_frames) == 0:
+            self.report({"ERROR"}, "No problem frames stored. Run Scan Animation first.")
+            return {"CANCELLED"}
+
+        scene = context.scene
+        prev_frame = int(scene.frame_current)
+        frames = sorted(set(int(it.frame) for it in settings.problem_frames))
+
+        view_layer = context.view_layer
+        prev_active = view_layer.objects.active
+
+        baked = 0
+        try:
+            with _temporary_mode_object(context):
+                for frame in frames:
+                    scene.frame_set(frame)
+                    depsgraph = context.evaluated_depsgraph_get()
+                    for garment_obj in garments:
+                        try:
+                            mismatch = _topology_mismatch(garment_obj=garment_obj, depsgraph=depsgraph)
+                            mods = _likely_topology_modifiers(garment_obj) if mismatch else []
+                            with _temporarily_disable_modifiers(garment_obj, mods):
+                                if mods:
+                                    context.view_layer.update()
+                                    depsgraph = context.evaluated_depsgraph_get()
+                                ensure_live_preserve_shapekey(garment_obj)
+                                changed, max_d = generate_shape_preservation(
+                                    garment_obj=garment_obj,
+                                    depsgraph=depsgraph,
+                                    strength=settings.shape_strength,
+                                    smoothing_iterations=settings.wrinkle_smoothing_iterations,
+                                    smoothing_strength=settings.wrinkle_smoothing_strength,
+                                    silhouette_preservation=settings.silhouette_preservation,
+                                    protect_borders=settings.protect_borders,
+                                    protect_groups=settings.protect_preserve_groups,
+                                )
+                            if changed <= 0:
+                                continue
+
+                            # Bake a per-frame preserve shape key (non-destructive; base topology).
+                            view_layer.objects.active = garment_obj
+                            key_name = f"CG_Preserve_{frame:04d}"
+                            # Bake from mix with preserve live enabled.
+                            preserve_kb = garment_obj.data.shape_keys.key_blocks.get(CG_SHAPEKEY_LIVE_PRESERVE)
+                            if preserve_kb is not None:
+                                preserve_kb.value = 1.0
+                            tmp = garment_obj.shape_key_add(name="CG__TMP_PRESERVE_BAKE", from_mix=True)
+                            try:
+                                target = garment_obj.data.shape_keys.key_blocks.get(key_name)
+                                if target is None:
+                                    tmp.name = key_name
+                                else:
+                                    for i in range(len(tmp.data)):
+                                        target.data[i].co = tmp.data[i].co
+                            finally:
+                                kb = garment_obj.data.shape_keys.key_blocks.get("CG__TMP_PRESERVE_BAKE")
+                                if kb is not None:
+                                    garment_obj.shape_key_remove(key_block=kb)
+
+                            _keyframe_shapekey_value(garment_obj=garment_obj, key_name=key_name, frame=frame - 1, value=0.0)
+                            _keyframe_shapekey_value(garment_obj=garment_obj, key_name=key_name, frame=frame, value=1.0)
+                            _keyframe_shapekey_value(garment_obj=garment_obj, key_name=key_name, frame=frame + 1, value=0.0)
+                            baked += 1
+                            print("[Cloth Guard][PreserveBake]", garment_obj.name, f"frame={frame}", f"key={key_name}", f"max_delta={max_d:.6f}")
+                        except Exception as e:
+                            self.report({"WARNING"}, f"{garment_obj.name} @ {frame}: preserve bake failed: {e}")
+                settings.enable_live_anti_clip = True
+        finally:
+            scene.frame_set(prev_frame)
+            view_layer.objects.active = prev_active
+
+        self.report({"INFO"}, f"Preserve bake complete: {len(frames)} frame(s), {baked} baked item(s)")
         return {"FINISHED"}
 
 

@@ -39,6 +39,9 @@ CG_MOD_ANTICLIP = "CG_AntiClip"
 CG_MOD_SMOOTH = "CG_Smooth"
 
 CG_SHAPEKEY_LIVE = "CG_LiveCorrection"
+CG_SHAPEKEY_LIVE_PRESERVE = "CG_LivePreserve"
+CG_SHAPEKEY_REST = "CG_RestShape"
+CG_VG_SHAPE_DRIFT = "CG_ShapeDrift"
 
 
 def is_mesh_object(obj) -> bool:
@@ -155,6 +158,24 @@ def ensure_live_correction_shapekey(garment_obj: bpy.types.Object) -> bpy.types.
     kb = keys.key_blocks.get(CG_SHAPEKEY_LIVE)
     if kb is None:
         kb = garment_obj.shape_key_add(name=CG_SHAPEKEY_LIVE, from_mix=False)
+    return kb
+
+
+def ensure_rest_shape_shapekey(garment_obj: bpy.types.Object) -> bpy.types.ShapeKey:
+    keys = _ensure_shape_keys(garment_obj)
+    kb = keys.key_blocks.get(CG_SHAPEKEY_REST)
+    if kb is None:
+        kb = garment_obj.shape_key_add(name=CG_SHAPEKEY_REST, from_mix=False)
+        kb.value = 0.0
+        kb.mute = True
+    return kb
+
+
+def ensure_live_preserve_shapekey(garment_obj: bpy.types.Object) -> bpy.types.ShapeKey:
+    keys = _ensure_shape_keys(garment_obj)
+    kb = keys.key_blocks.get(CG_SHAPEKEY_LIVE_PRESERVE)
+    if kb is None:
+        kb = garment_obj.shape_key_add(name=CG_SHAPEKEY_LIVE_PRESERVE, from_mix=False)
     return kb
 
 
@@ -716,6 +737,217 @@ def write_weights_to_vertex_group(
     return affected
 
 
+@dataclass(frozen=True)
+class ShapeDriftStats:
+    checked_verts: int
+    flagged_verts: int
+    max_drift_distance: float
+    avg_flagged_drift: float | None
+
+
+def _vector_safe_avg(vals: Iterable[float]) -> float | None:
+    arr = [float(v) for v in vals]
+    return (sum(arr) / len(arr)) if arr else None
+
+
+def store_rest_shape(
+    *,
+    garment_obj: bpy.types.Object,
+    depsgraph,
+    cage_eval_obj: bpy.types.Object | None = None,
+) -> int:
+    """
+    Store the current evaluated (typically clean) garment shape into CG_RestShape (non-destructive).
+    Returns number of vertices written.
+    """
+    if garment_obj.type != "MESH":
+        raise RuntimeError("Garment is not a mesh")
+
+    obj_eval = cage_eval_obj if cage_eval_obj is not None else garment_obj.evaluated_get(depsgraph)
+    mesh_eval = obj_eval.to_mesh()
+    try:
+        base_mesh = garment_obj.data
+        if len(mesh_eval.vertices) != len(base_mesh.vertices):
+            raise RuntimeError("Rest shape storage requires a topology-stable cage evaluation")
+
+        kb = ensure_rest_shape_shapekey(garment_obj)
+        for i in range(len(base_mesh.vertices)):
+            kb.data[i].co = mesh_eval.vertices[i].co
+        kb.value = 0.0
+        kb.mute = True
+        return len(base_mesh.vertices)
+    finally:
+        obj_eval.to_mesh_clear()
+
+
+def analyze_shape_drift(
+    *,
+    garment_obj: bpy.types.Object,
+    depsgraph,
+    drift_threshold: float,
+    cage_eval_obj: bpy.types.Object | None = None,
+    protect_borders: bool = True,
+    protect_scale: float = 0.5,
+) -> tuple[ShapeDriftStats, list[float]]:
+    """
+    Compare current evaluated cage shape to CG_RestShape and produce per-vertex drift weights.
+    Returns (stats, weights) suitable for writing into CG_ShapeDrift.
+    """
+    if garment_obj.data.shape_keys is None or garment_obj.data.shape_keys.key_blocks.get(CG_SHAPEKEY_REST) is None:
+        raise RuntimeError("Missing rest shape. Click Store Rest Shape first.")
+
+    rest = garment_obj.data.shape_keys.key_blocks.get(CG_SHAPEKEY_REST)
+    if rest is None:
+        raise RuntimeError("Missing rest shape. Click Store Rest Shape first.")
+
+    obj_eval = cage_eval_obj if cage_eval_obj is not None else garment_obj.evaluated_get(depsgraph)
+    mesh_eval = obj_eval.to_mesh()
+    try:
+        base_mesh = garment_obj.data
+        if len(mesh_eval.vertices) != len(base_mesh.vertices) or len(rest.data) != len(base_mesh.vertices):
+            raise RuntimeError("Shape drift analysis requires a topology-stable cage evaluation")
+
+        drift_threshold = max(1e-8, float(drift_threshold))
+        boundary_mask = _boundary_vertex_mask(base_mesh) if protect_borders else [False] * len(base_mesh.vertices)
+
+        weights = [0.0] * len(base_mesh.vertices)
+        flagged = 0
+        max_drift = 0.0
+        flagged_drifts: list[float] = []
+
+        for i in range(len(base_mesh.vertices)):
+            d = mesh_eval.vertices[i].co - rest.data[i].co
+            dist = float(d.length)
+            max_drift = max(max_drift, dist)
+            if dist <= drift_threshold:
+                continue
+            w = max(0.0, min(1.0, (dist - drift_threshold) / max(drift_threshold, 1e-8)))
+            if boundary_mask[i]:
+                w *= float(protect_scale)
+            if w > 0.0:
+                flagged += 1
+                flagged_drifts.append(dist)
+                weights[i] = w
+
+        stats = ShapeDriftStats(
+            checked_verts=len(base_mesh.vertices),
+            flagged_verts=flagged,
+            max_drift_distance=max_drift,
+            avg_flagged_drift=_vector_safe_avg(flagged_drifts),
+        )
+        return stats, weights
+    finally:
+        obj_eval.to_mesh_clear()
+
+
+def generate_shape_preservation(
+    *,
+    garment_obj: bpy.types.Object,
+    depsgraph,
+    strength: float,
+    smoothing_iterations: int,
+    smoothing_strength: float,
+    silhouette_preservation: float,
+    protect_borders: bool,
+    protect_groups: bool,
+    cage_eval_obj: bpy.types.Object | None = None,
+) -> tuple[int, float]:
+    """
+    Generate/update CG_LivePreserve to reduce high-frequency drift compared to CG_RestShape.
+    Returns (changed_verts, max_delta_world_m).
+    """
+    if garment_obj.type != "MESH":
+        raise RuntimeError("Garment is not a mesh")
+    if garment_obj.data.shape_keys is None or garment_obj.data.shape_keys.key_blocks.get(CG_SHAPEKEY_REST) is None:
+        raise RuntimeError("Missing rest shape. Click Store Rest Shape first.")
+
+    strength = max(0.0, min(1.0, float(strength)))
+    smoothing_iterations = max(0, int(smoothing_iterations))
+    smoothing_strength = max(0.0, min(1.0, float(smoothing_strength)))
+    silhouette_preservation = max(0.0, min(1.0, float(silhouette_preservation)))
+
+    rest = garment_obj.data.shape_keys.key_blocks.get(CG_SHAPEKEY_REST)
+    if rest is None:
+        raise RuntimeError("Missing rest shape. Click Store Rest Shape first.")
+
+    obj_eval = cage_eval_obj if cage_eval_obj is not None else garment_obj.evaluated_get(depsgraph)
+    mesh_eval = obj_eval.to_mesh()
+    try:
+        base_mesh = garment_obj.data
+        if len(mesh_eval.vertices) != len(base_mesh.vertices) or len(rest.data) != len(base_mesh.vertices):
+            raise RuntimeError("Shape preservation requires a topology-stable cage evaluation")
+
+        drift: list[Vector] = [Vector((0.0, 0.0, 0.0)) for _ in range(len(base_mesh.vertices))]
+        for i in range(len(base_mesh.vertices)):
+            drift[i] = mesh_eval.vertices[i].co - rest.data[i].co
+
+        smoothed = _smooth_deltas(
+            deltas=drift,
+            adjacency=_build_vertex_adjacency(base_mesh),
+            iterations=int(smoothing_iterations),
+            strength=float(smoothing_strength),
+        )
+
+        boundary_mask = _boundary_vertex_mask(base_mesh) if protect_borders else [False] * len(base_mesh.vertices)
+        boundary_scale = 0.25
+
+        pinned_idx = _vertex_group_index(garment_obj, CG_VG_PINNED) if protect_groups else None
+        collar_idx = _vertex_group_index(garment_obj, CG_VG_PRESERVE_COLLAR) if protect_groups else None
+        hem_idx = _vertex_group_index(garment_obj, CG_VG_PRESERVE_HEM) if protect_groups else None
+        seams_idx = _vertex_group_index(garment_obj, CG_VG_PRESERVE_SEAMS) if protect_groups else None
+        preserve_scale = 0.75
+
+        live = ensure_live_preserve_shapekey(garment_obj)
+        basis = garment_obj.data.shape_keys.key_blocks[0]
+
+        changed = 0
+        max_delta_world = 0.0
+        mw3 = garment_obj.matrix_world.to_3x3()
+
+        for i in range(len(base_mesh.vertices)):
+            corr = (smoothed[i] - drift[i]) * strength
+
+            # Silhouette preservation: reduce normal component of the correction.
+            n = base_mesh.vertices[i].normal
+            if n.length > 1e-12:
+                n = n.normalized()
+                cn = n * float(corr.dot(n))
+                ct = corr - cn
+                corr = ct + cn * float(1.0 - silhouette_preservation)
+
+            scale = 1.0
+            if pinned_idx is not None:
+                pw = _vertex_weight(base_mesh.vertices[i], pinned_idx)
+                if pw > 0.0:
+                    scale *= max(0.0, 1.0 - pw)
+
+            preserve_w = 0.0
+            if collar_idx is not None:
+                preserve_w = max(preserve_w, _vertex_weight(base_mesh.vertices[i], collar_idx))
+            if hem_idx is not None:
+                preserve_w = max(preserve_w, _vertex_weight(base_mesh.vertices[i], hem_idx))
+            if seams_idx is not None:
+                preserve_w = max(preserve_w, _vertex_weight(base_mesh.vertices[i], seams_idx))
+            if preserve_w > 0.0:
+                scale *= max(0.0, 1.0 - preserve_w * preserve_scale)
+
+            if boundary_mask[i]:
+                scale *= boundary_scale
+
+            corr *= scale
+            live.data[i].co = basis.data[i].co + corr
+
+            ln = float(corr.length)
+            if ln > 1e-12:
+                changed += 1
+                max_delta_world = max(max_delta_world, float((mw3 @ corr).length))
+
+        live.value = 1.0
+        return changed, max_delta_world
+    finally:
+        obj_eval.to_mesh_clear()
+
+
 def ensure_body_mask_modifier(body_obj: bpy.types.Object) -> bpy.types.MaskModifier:
     mod = body_obj.modifiers.get(CG_MOD_BODY_MASK)
     if mod is None:
@@ -802,6 +1034,9 @@ def cg_update_modifier_visibility(context) -> None:
             kb = garment_obj.data.shape_keys.key_blocks.get(CG_SHAPEKEY_LIVE)
             if kb is not None:
                 kb.value = 1.0 if enabled else 0.0
+            kb2 = garment_obj.data.shape_keys.key_blocks.get(CG_SHAPEKEY_LIVE_PRESERVE)
+            if kb2 is not None:
+                kb2.value = 1.0 if enabled else 0.0
 
         # Legacy modifier-based workflow (kept for backwards compatibility if present).
         for mod_name in (CG_MOD_ANTICLIP, CG_MOD_SMOOTH):

@@ -56,6 +56,24 @@ class CG_PT_main(Panel):
         settings = context.scene.cg_settings
 
         box = layout.box()
+        box.label(text="Shape Preservation / Stabilization")
+        row = box.row(align=True)
+        row.operator("cloth_guard.store_rest_shape", text="Store Rest Shape")
+        row.operator("cloth_guard.analyze_shape_drift", text="Analyze Shape Drift")
+        row = box.row(align=True)
+        row.operator("cloth_guard.generate_shape_preservation_current", text="Preserve Shape (Current)")
+        row.operator("cloth_guard.generate_shape_preservation_flagged", text="Preserve Shape (All Flagged)")
+        col = box.column(align=True)
+        col.prop(settings, "shape_strength")
+        col.prop(settings, "wrinkle_smoothing_iterations")
+        col.prop(settings, "wrinkle_smoothing_strength")
+        col.prop(settings, "silhouette_preservation")
+        row = col.row(align=True)
+        row.prop(settings, "protect_borders")
+        row.prop(settings, "protect_preserve_groups")
+        col.prop(settings, "drift_threshold")
+
+        box = layout.box()
         box.label(text="Object Assignment")
         box.prop(settings, "body_object")
 

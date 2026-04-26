@@ -253,6 +253,63 @@ class CG_Settings(PropertyGroup):
         subtype="FACTOR",
     )
 
+    shape_strength: FloatProperty(
+        name="Shape Strength",
+        description="Strength of shape preservation corrective (reduces unwanted distortion while keeping pose deformation)",
+        default=0.5,
+        min=0.0,
+        max=1.0,
+        subtype="FACTOR",
+    )
+
+    wrinkle_smoothing_iterations: IntProperty(
+        name="Wrinkle Smoothing",
+        description="Iterations of smoothing applied to the drift field (higher removes more high-frequency wrinkles)",
+        default=10,
+        min=0,
+        max=200,
+    )
+
+    wrinkle_smoothing_strength: FloatProperty(
+        name="Wrinkle Smooth Strength",
+        description="Smoothing strength for wrinkle removal (higher = stronger smoothing)",
+        default=0.6,
+        min=0.0,
+        max=1.0,
+        subtype="FACTOR",
+    )
+
+    silhouette_preservation: FloatProperty(
+        name="Silhouette Preservation",
+        description="Reduce normal-direction correction to preserve garment thickness/silhouette (1 = strongest preservation)",
+        default=0.75,
+        min=0.0,
+        max=1.0,
+        subtype="FACTOR",
+    )
+
+    protect_borders: BoolProperty(
+        name="Protect Borders",
+        description="Reduce shape preservation near open borders (collars/hems) to avoid silhouette distortion",
+        default=True,
+    )
+
+    protect_preserve_groups: BoolProperty(
+        name="Protect Collar/Hem/Seams",
+        description="Use preserve/pinned vertex groups to attenuate shape preservation in important design areas",
+        default=True,
+    )
+
+    drift_threshold: FloatProperty(
+        name="Drift Threshold",
+        description="Minimum drift distance (meters) before a vertex is considered distorted (used for Analyze Shape Drift)",
+        default=0.005,
+        min=0.0,
+        soft_max=0.05,
+        subtype="DISTANCE",
+        unit="LENGTH",
+    )
+
     mask_distance: FloatProperty(
         name="Mask Distance",
         description="Distance threshold for hiding body parts under the garment",

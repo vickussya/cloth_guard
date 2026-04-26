@@ -1,6 +1,6 @@
 # Cloth Guard (Blender Add-on)
 
-Cloth Guard helps animators preserve garment shape and reduce body clipping without running cloth simulations.
+Post-animation garment cleanup for Blender: preserve stylized clothing shapes and reduce body clipping without cloth simulation.
 
 **Cloth Guard** is a production-friendly, non-simulation toolset for keeping rigged clothing closer to its designed silhouette during character animation, while minimizing (as much as realistically possible) clipping into the body.
 
@@ -20,6 +20,7 @@ Rigged garments often look good in a rest pose but clip into the character durin
 - **Clipping/contact detection**: create/update `CG_Contact` (near-body) and `CG_Clipping` (likely penetration) vertex groups per garment
 - **Post-animation cleanup**: scan a frame range to find problem frames, then jump to and fix only those frames
 - **Non-destructive correction**: generates/updates a live corrective shape key (`CG_LiveCorrection`) instead of modifying the base mesh
+- **Shape preservation / stabilization**: store a clean rest/reference shape and generate a live preservation corrective (`CG_LivePreserve`) to reduce unwanted deformation wrinkles while keeping pose deformation
 - **Risk/control groups**: optional vertex groups (Risk, Pinned, Preserve Collar/Hem/Seams)
 - **Corrective shape keys**: bake the current corrected state into a named shape key; optional bone-rotation driver linking (MVP)
 - **Per-frame baking**: bake non-destructive per-frame correctives (shape keys) for current frame or for all flagged frames
@@ -53,6 +54,14 @@ This repository is structured so the GitHub **Code -> Download ZIP** archive can
    - Click **Update Live Corrective** to preview a non-destructive fix (`CG_LiveCorrection`)
    - Click **Generate Correction (Current)** or **Generate Corrections (All Flagged)** to bake per-frame shape keys
 8. For artist-authored fixes, click **Create Corrective Shape Key From Current Pose**, name it, and optionally link it to a bone rotation.
+
+## Shape preservation (what it does)
+
+Shape preservation is designed for stylized/clean garments that should keep a designed form during animation:
+
+- **Store Rest Shape** captures a clean reference (e.g. your ideal rest pose form).
+- **Analyze Shape Drift** writes `CG_ShapeDrift` to visualize areas that distort beyond a threshold.
+- **Preserve Shape (Current)** generates `CG_LivePreserve` to reduce high-frequency “wrinkle noise” while still following the animation.
 
 ## Body masking (what it does)
 
