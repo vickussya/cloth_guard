@@ -848,7 +848,9 @@ class CG_OT_generate_shape_preservation_current(Operator):
                             strength=settings.shape_strength,
                             smoothing_iterations=settings.wrinkle_smoothing_iterations,
                             smoothing_strength=settings.wrinkle_smoothing_strength,
+                            volume_preservation=settings.volume_preservation,
                             silhouette_preservation=settings.silhouette_preservation,
+                            drift_threshold=settings.drift_threshold,
                             protect_borders=settings.protect_borders,
                             protect_groups=settings.protect_preserve_groups,
                         )
@@ -915,7 +917,9 @@ class CG_OT_generate_shape_preservation_flagged(Operator):
                                     strength=settings.shape_strength,
                                     smoothing_iterations=settings.wrinkle_smoothing_iterations,
                                     smoothing_strength=settings.wrinkle_smoothing_strength,
+                                    volume_preservation=settings.volume_preservation,
                                     silhouette_preservation=settings.silhouette_preservation,
+                                    drift_threshold=settings.drift_threshold,
                                     protect_borders=settings.protect_borders,
                                     protect_groups=settings.protect_preserve_groups,
                                 )

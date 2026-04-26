@@ -61,7 +61,7 @@ Shape preservation is designed for stylized/clean garments that should keep a de
 
 - **Store Rest Shape** captures a clean reference (e.g. your ideal rest pose form).
 - **Analyze Shape Drift** writes `CG_ShapeDrift` to visualize areas that distort beyond a threshold.
-- **Preserve Shape (Current)** generates `CG_LivePreserve` to reduce high-frequency “wrinkle noise” while still following the animation.
+- **Preserve Shape (Current)** generates `CG_LivePreserve` to reduce high-frequency “wrinkle noise” while still following the animation (it does **not** try to restore the garment back to a rest pose).
 
 ## Body masking (what it does)
 

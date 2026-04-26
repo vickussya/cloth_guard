@@ -265,7 +265,7 @@ class CG_Settings(PropertyGroup):
     wrinkle_smoothing_iterations: IntProperty(
         name="Wrinkle Smoothing",
         description="Iterations of smoothing applied to the drift field (higher removes more high-frequency wrinkles)",
-        default=10,
+        default=5,
         min=0,
         max=200,
     )
@@ -273,7 +273,16 @@ class CG_Settings(PropertyGroup):
     wrinkle_smoothing_strength: FloatProperty(
         name="Wrinkle Smooth Strength",
         description="Smoothing strength for wrinkle removal (higher = stronger smoothing)",
-        default=0.6,
+        default=0.35,
+        min=0.0,
+        max=1.0,
+        subtype="FACTOR",
+    )
+
+    volume_preservation: FloatProperty(
+        name="Volume Preservation",
+        description="Prevents inward collapse by reducing inward normal-direction corrections (1 = strongest protection)",
+        default=0.9,
         min=0.0,
         max=1.0,
         subtype="FACTOR",

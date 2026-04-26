@@ -215,6 +215,61 @@ def _smooth_deltas(
     return cur
 
 
+def _smooth_deltas_structural(
+    *,
+    deltas: list[Vector],
+    adjacency: list[list[int]],
+    rest_normals: list[Vector],
+    drift_threshold: float,
+    iterations: int,
+    strength: float,
+    normal_cos_limit: float = 0.5,
+) -> list[Vector]:
+    """
+    Structure-aware smoothing for drift fields.
+
+    - Avoids smoothing across sharp normal changes (collars/edges) using a cosine limit.
+    - Avoids removing large-scale deformation by down-weighting edges where drift differs a lot.
+    """
+    if iterations <= 0 or strength <= 0.0:
+        return deltas
+    strength = max(0.0, min(1.0, float(strength)))
+    drift_threshold = max(1e-8, float(drift_threshold))
+
+    # Pre-normalize normals.
+    rn = []
+    for n in rest_normals:
+        rn.append(n.normalized() if n.length > 1e-12 else Vector((0.0, 0.0, 1.0)))
+
+    cur = deltas
+    for _ in range(int(iterations)):
+        nxt = [v.copy() for v in cur]
+        for i, nbrs in enumerate(adjacency):
+            if not nbrs:
+                continue
+            acc = Vector((0.0, 0.0, 0.0))
+            wsum = 0.0
+            ni = rn[i]
+            for j in nbrs:
+                nj = rn[j]
+                nd = float(ni.dot(nj))
+                if nd < normal_cos_limit:
+                    continue
+                # Drift similarity: if drift varies a lot across an edge, treat it as large-scale deformation and smooth less.
+                dd = float((cur[j] - cur[i]).length)
+                sim = max(0.0, 1.0 - (dd / (drift_threshold * 4.0)))
+                w = nd * sim
+                if w <= 0.0:
+                    continue
+                acc += cur[j] * w
+                wsum += w
+            if wsum > 1e-12:
+                avg = acc / wsum
+                nxt[i] = cur[i].lerp(avg, strength)
+        cur = nxt
+    return cur
+
+
 def detect_clipping(
     *,
     garment_obj: bpy.types.Object,
@@ -268,8 +323,9 @@ def detect_clipping(
 
         # Boundary attenuation helps avoid noisy selections on open edges (collars/hem boundaries).
         boundary_mask = _boundary_vertex_mask(base_mesh)
-        boundary_contact_scale = 0.25
-        boundary_clipping_scale = 0.6
+        # Strongly protect open borders/silhouette edges from false positives.
+        boundary_contact_scale = 0.1
+        boundary_clipping_scale = 0.25
 
         # When normals are noisy or inconsistent, require a small negative dot to call it penetration.
         penetration_eps = max(1e-6, offset_distance * 0.05)
@@ -399,6 +455,10 @@ def detect_clipping(
                     idx = int(vi)
                     if risk_idx is not None and _vertex_weight(base_mesh.vertices[idx], risk_idx) <= 0.0:
                         continue
+                    if boundary_mask[idx]:
+                        # Avoid escalating borders unless they are already strongly penetrating.
+                        if clipping_weights[idx] < 0.9:
+                            continue
                     # Escalate: intersection-like evidence.
                     clipping_weights[idx] = max(clipping_weights[idx], 1.0)
                     contact_weights[idx] = max(contact_weights[idx], 1.0)
@@ -847,7 +907,9 @@ def generate_shape_preservation(
     strength: float,
     smoothing_iterations: int,
     smoothing_strength: float,
+    volume_preservation: float,
     silhouette_preservation: float,
+    drift_threshold: float,
     protect_borders: bool,
     protect_groups: bool,
     cage_eval_obj: bpy.types.Object | None = None,
@@ -864,7 +926,9 @@ def generate_shape_preservation(
     strength = max(0.0, min(1.0, float(strength)))
     smoothing_iterations = max(0, int(smoothing_iterations))
     smoothing_strength = max(0.0, min(1.0, float(smoothing_strength)))
+    volume_preservation = max(0.0, min(1.0, float(volume_preservation)))
     silhouette_preservation = max(0.0, min(1.0, float(silhouette_preservation)))
+    drift_threshold = max(1e-8, float(drift_threshold))
 
     rest = garment_obj.data.shape_keys.key_blocks.get(CG_SHAPEKEY_REST)
     if rest is None:
@@ -873,6 +937,7 @@ def generate_shape_preservation(
     obj_eval = cage_eval_obj if cage_eval_obj is not None else garment_obj.evaluated_get(depsgraph)
     mesh_eval = obj_eval.to_mesh()
     try:
+        mesh_eval.calc_normals()
         base_mesh = garment_obj.data
         if len(mesh_eval.vertices) != len(base_mesh.vertices) or len(rest.data) != len(base_mesh.vertices):
             raise RuntimeError("Shape preservation requires a topology-stable cage evaluation")
@@ -881,9 +946,13 @@ def generate_shape_preservation(
         for i in range(len(base_mesh.vertices)):
             drift[i] = mesh_eval.vertices[i].co - rest.data[i].co
 
-        smoothed = _smooth_deltas(
+        adjacency = _build_vertex_adjacency(base_mesh)
+        rest_normals = [v.normal.copy() for v in base_mesh.vertices]
+        smoothed = _smooth_deltas_structural(
             deltas=drift,
-            adjacency=_build_vertex_adjacency(base_mesh),
+            adjacency=adjacency,
+            rest_normals=rest_normals,
+            drift_threshold=drift_threshold,
             iterations=int(smoothing_iterations),
             strength=float(smoothing_strength),
         )
@@ -907,13 +976,25 @@ def generate_shape_preservation(
         for i in range(len(base_mesh.vertices)):
             corr = (smoothed[i] - drift[i]) * strength
 
-            # Silhouette preservation: reduce normal component of the correction.
-            n = base_mesh.vertices[i].normal
-            if n.length > 1e-12:
-                n = n.normalized()
-                cn = n * float(corr.dot(n))
-                ct = corr - cn
-                corr = ct + cn * float(1.0 - silhouette_preservation)
+            # Prevent inward collapse: reduce inward normal component relative to the CURRENT pose normal.
+            cn = mesh_eval.vertices[i].normal
+            if cn.length > 1e-12:
+                cn = cn.normalized()
+                dotn = float(corr.dot(cn))
+                cn_comp = cn * dotn
+                ct_comp = corr - cn_comp
+                if dotn < 0.0:
+                    cn_comp *= float(1.0 - volume_preservation)
+                corr = ct_comp + cn_comp
+
+            # Silhouette preservation: additionally reduce normal component in rest space (helps keep thickness/opening).
+            rn = base_mesh.vertices[i].normal
+            if rn.length > 1e-12:
+                rn = rn.normalized()
+                dotr = float(corr.dot(rn))
+                rn_comp = rn * dotr
+                rt_comp = corr - rn_comp
+                corr = rt_comp + rn_comp * float(1.0 - silhouette_preservation)
 
             scale = 1.0
             if pinned_idx is not None:
@@ -935,6 +1016,13 @@ def generate_shape_preservation(
                 scale *= boundary_scale
 
             corr *= scale
+
+            # Clamp: never remove more than a fraction of the local drift magnitude (avoids global pull/size shrink).
+            drift_len = float(drift[i].length)
+            corr_len = float(corr.length)
+            if drift_len > 1e-8 and corr_len > drift_len * 0.75:
+                corr *= (drift_len * 0.75) / max(corr_len, 1e-12)
+
             live.data[i].co = basis.data[i].co + corr
 
             ln = float(corr.length)

@@ -67,6 +67,7 @@ class CG_PT_main(Panel):
         col.prop(settings, "shape_strength")
         col.prop(settings, "wrinkle_smoothing_iterations")
         col.prop(settings, "wrinkle_smoothing_strength")
+        col.prop(settings, "volume_preservation")
         col.prop(settings, "silhouette_preservation")
         row = col.row(align=True)
         row.prop(settings, "protect_borders")
