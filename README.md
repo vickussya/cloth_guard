@@ -15,14 +15,15 @@ Rigged garments often look good in a rest pose but clip into the character durin
 
 ## Key features (MVP)
 
-- **Garment setup**: assign a Body mesh and a Garment mesh
+- **Multi-garment workflow**: assign a Body mesh and add multiple garment mesh objects
 - **Body masking**: generate a vertex-group-driven Mask modifier on the body for hiding regions under the garment
-- **Clipping detection**: create/update a `CG_Clipping` vertex group on the garment for problematic vertices
-- **Current pose correction**: configure an anti-clip modifier stack on the garment (no simulation) driven by proximity weights
+- **Clipping/contact detection**: create/update `CG_Contact` (near-body) and `CG_Clipping` (likely penetration) vertex groups per garment
+- **Post-animation cleanup**: scan a frame range to find problem frames, then jump to and fix only those frames
+- **Non-destructive correction**: generates/updates a live corrective shape key (`CG_LiveCorrection`) instead of modifying the base mesh
 - **Risk/control groups**: optional vertex groups (Risk, Pinned, Preserve Collar/Hem/Seams)
 - **Corrective shape keys**: bake the current corrected state into a named shape key; optional bone-rotation driver linking (MVP)
-- **Bake corrections**: current-pose baking implemented; frame-range baking is intentionally left for a future update
-- **Live anti-clip toggle**: enable/disable the anti-clip modifiers and refresh weights when needed
+- **Per-frame baking**: bake non-destructive per-frame correctives (shape keys) for current frame or for all flagged frames
+- **Live anti-clip toggle**: enable/disable `CG_LiveCorrection` quickly while reviewing
 
 ## Supported Blender version
 
@@ -45,9 +46,13 @@ This repository is structured so the GitHub **Code -> Download ZIP** archive can
 3. Assign **Body Object** and add garments to the **Garments** list (select garments in the viewport, then click **+**).
 4. Click **Setup Cloth Guard**.
 5. Click **Create Body Mask** to hide body parts under the garment.
-6. Click **Detect Clipping** to visualize problem regions in `CG_Clipping`.
-7. Click **Correct Current Pose** (or **Refresh Live Correction**) to update proximity weights and run the anti-clip modifier stack.
-8. For hard poses, click **Create Corrective Shape Key From Current Pose**, name it, and optionally link it to a bone rotation.
+6. (Optional) Click **Detect Clipping** to visualize `CG_Contact` / `CG_Clipping` on the current frame.
+7. Use **Post-Animation Cleanup**:
+   - Set Start/End/Step and click **Scan Animation**
+   - Select a flagged frame and click **Go To Problem Frame**
+   - Click **Update Live Corrective** to preview a non-destructive fix (`CG_LiveCorrection`)
+   - Click **Generate Correction (Current)** or **Generate Corrections (All Flagged)** to bake per-frame shape keys
+8. For artist-authored fixes, click **Create Corrective Shape Key From Current Pose**, name it, and optionally link it to a bone rotation.
 
 ## Body masking (what it does)
 
@@ -62,8 +67,8 @@ This is a visibility/cleanup workflow - it does not physically push the cloth aw
 
 Cloth Guard's MVP anti-clip correction is intentionally **non-simulation**:
 
-- It computes a proximity-based weight map (`CG_Clipping`) using closest-surface distance to the body
-- A Shrinkwrap-based anti-clip modifier stack (plus optional smoothing) pushes only the weighted vertices toward the body surface and offsets them outward
+- It computes contact/clipping weights (`CG_Contact` / `CG_Clipping`) using closest-surface distance plus a penetration heuristic
+- It writes deltas into a live shape key (`CG_LiveCorrection`) so the correction is **non-destructive** and can be disabled instantly
 
 This aims for **small, predictable fixes** rather than aggressive "perfect collisions".
 

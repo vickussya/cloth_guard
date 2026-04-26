@@ -33,6 +33,17 @@ class CG_UL_garments(UIList):
             row.prop(item, "object", text="", emboss=False, icon="MESH_DATA")
 
 
+class CG_UL_problem_frames(UIList):
+    bl_idname = "CG_UL_problem_frames"
+
+    def draw_item(
+        self, context, layout, data, item, icon, active_data, active_propname, index
+    ):
+        row = layout.row(align=True)
+        row.label(text=str(getattr(item, "frame", "?")), icon="TIME")
+        row.label(text=f"Clipping: {getattr(item, 'clipping_verts', 0)}")
+
+
 class CG_PT_main(Panel):
     bl_label = "Cloth Guard"
     bl_idname = "CG_PT_main"
@@ -69,6 +80,41 @@ class CG_PT_main(Panel):
         row = box.row(align=True)
         row.operator("cloth_guard.add_selected_garments", text="Add Selected Garment(s)")
         row.operator("cloth_guard.remove_active_garment", text="Remove")
+
+        box = layout.box()
+        box.label(text="Post-Animation Cleanup")
+        row = box.row(align=True)
+        row.prop(settings, "scan_start_frame")
+        row.prop(settings, "scan_end_frame")
+        box.prop(settings, "scan_frame_step")
+
+        row = box.row(align=True)
+        row.operator("cloth_guard.scan_animation", text="Scan Animation")
+        row.operator("cloth_guard.clear_problem_frames", text="Clear List")
+
+        row = box.row()
+        row.template_list(
+            "CG_UL_problem_frames",
+            "",
+            settings,
+            "problem_frames",
+            settings,
+            "active_problem_frame_index",
+            rows=6,
+        )
+        col = row.column(align=True)
+        col.operator("cloth_guard.go_to_problem_frame", text="", icon="FRAME_PREV")
+
+        row = box.row(align=True)
+        row.operator("cloth_guard.go_to_problem_frame", text="Go To Problem Frame")
+        row.operator("cloth_guard.generate_correction_current_frame", text="Generate Correction (Current)")
+        row = box.row(align=True)
+        row.operator("cloth_guard.generate_corrections_flagged_frames", text="Generate Corrections (All Flagged)")
+
+        if 0 <= settings.active_problem_frame_index < len(settings.problem_frames):
+            item = settings.problem_frames[settings.active_problem_frame_index]
+            if getattr(item, "details", ""):
+                box.label(text=item.details, icon="INFO")
 
         box = layout.box()
         box.label(text="Setup")

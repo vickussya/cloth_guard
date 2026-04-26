@@ -55,6 +55,45 @@ class CG_GarmentItem(PropertyGroup):
     )
 
 
+class CG_ProblemFrameItem(PropertyGroup):
+    frame: IntProperty(
+        name="Frame",
+        description="Frame number where clipping was detected",
+        default=1,
+        min=1,
+    )
+
+    contact_verts: IntProperty(
+        name="Contact Verts",
+        description="Total near-body vertices (CG_Contact) at this frame (sum across garments)",
+        default=0,
+        min=0,
+    )
+
+    clipping_verts: IntProperty(
+        name="Clipping Verts",
+        description="Total likely-penetrating vertices (CG_Clipping) at this frame (sum across garments)",
+        default=0,
+        min=0,
+    )
+
+    min_distance: FloatProperty(
+        name="Min Distance",
+        description="Minimum nearest distance found at this frame",
+        default=0.0,
+        min=0.0,
+        subtype="DISTANCE",
+        unit="LENGTH",
+    )
+
+    details: StringProperty(
+        name="Details",
+        description="Per-garment summary for this frame",
+        default="",
+        maxlen=1024,
+    )
+
+
 class CG_Settings(PropertyGroup):
     body_object: PointerProperty(
         name="Body Object",
@@ -71,6 +110,40 @@ class CG_Settings(PropertyGroup):
 
     active_garment_index: IntProperty(
         name="Active Garment Index",
+        default=0,
+        min=0,
+    )
+
+    scan_start_frame: IntProperty(
+        name="Start Frame",
+        description="Start frame for Scan Animation",
+        default=1,
+        min=1,
+    )
+
+    scan_end_frame: IntProperty(
+        name="End Frame",
+        description="End frame for Scan Animation",
+        default=250,
+        min=1,
+    )
+
+    scan_frame_step: IntProperty(
+        name="Frame Step",
+        description="Frame step for scanning (higher = faster, less precise)",
+        default=1,
+        min=1,
+        max=1000,
+    )
+
+    problem_frames: CollectionProperty(
+        name="Problem Frames",
+        type=CG_ProblemFrameItem,
+        description="Frames flagged during Scan Animation",
+    )
+
+    active_problem_frame_index: IntProperty(
+        name="Active Problem Frame Index",
         default=0,
         min=0,
     )

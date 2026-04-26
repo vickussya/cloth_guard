@@ -619,6 +619,276 @@ class CG_OT_clear_live_correction(Operator):
         return {"FINISHED"}
 
 
+class CG_OT_scan_animation(Operator):
+    bl_idname = "cloth_guard.scan_animation"
+    bl_label = "Scan Animation"
+    bl_description = "Scan a frame range to find frames with likely garment/body penetration (post-animation cleanup)"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        settings = _settings(context)
+        validated = _validate_assigned_meshes(settings)
+        if validated is None:
+            self.report({"ERROR"}, "Assign a valid Body mesh and add garment mesh objects to the Garments list first")
+            return {"CANCELLED"}
+        body_obj, garments = validated
+
+        start = int(settings.scan_start_frame)
+        end = int(settings.scan_end_frame)
+        step = int(settings.scan_frame_step)
+        if step <= 0:
+            step = 1
+        if end < start:
+            start, end = end, start
+
+        settings.problem_frames.clear()
+        settings.active_problem_frame_index = 0
+
+        scene = context.scene
+        prev_frame = int(scene.frame_current)
+        flagged_frames = 0
+
+        try:
+            for frame in range(start, end + 1, step):
+                scene.frame_set(frame)
+                depsgraph = context.evaluated_depsgraph_get()
+
+                total_contact = 0
+                total_clipping = 0
+                min_dist = None
+                details_parts: list[str] = []
+
+                for garment_obj in garments:
+                    try:
+                        res = detect_clipping(
+                            garment_obj=garment_obj,
+                            body_obj=body_obj,
+                            depsgraph=depsgraph,
+                            offset_distance=settings.offset_distance,
+                            detection_radius=max(settings.offset_distance, settings.detection_radius),
+                            use_risk_area=settings.use_risk_area,
+                        )
+                    except Exception as e:
+                        details_parts.append(f"{garment_obj.name}:ERR")
+                        print("[Cloth Guard][Scan]", garment_obj.name, "ERROR", e)
+                        continue
+
+                    s = res.stats
+                    total_contact += int(s.flagged_contact)
+                    total_clipping += int(s.flagged_clipping)
+                    if s.min_nearest_distance is not None:
+                        min_dist = s.min_nearest_distance if min_dist is None else min(min_dist, s.min_nearest_distance)
+                    if s.flagged_clipping > 0:
+                        details_parts.append(f"{garment_obj.name}:{int(s.flagged_clipping)}")
+
+                if total_clipping > 0:
+                    item = settings.problem_frames.add()
+                    item.frame = frame
+                    item.contact_verts = int(total_contact)
+                    item.clipping_verts = int(total_clipping)
+                    item.min_distance = float(min_dist) if min_dist is not None else 0.0
+                    item.details = ", ".join(details_parts)[:1024]
+                    flagged_frames += 1
+
+                if frame == start or frame == end or (frame - start) % max(step * 10, 1) == 0:
+                    min_txt = f"{min_dist:.6f} m" if min_dist is not None else "n/a"
+                    print(
+                        "[Cloth Guard][Scan]",
+                        f"frame={frame}",
+                        f"contact={total_contact}",
+                        f"clipping={total_clipping}",
+                        f"min={min_txt}",
+                    )
+        finally:
+            scene.frame_set(prev_frame)
+
+        self.report({"INFO"}, f"Scan complete: {flagged_frames} problem frame(s) flagged ({start}-{end} step {step})")
+        return {"FINISHED"}
+
+
+class CG_OT_clear_problem_frames(Operator):
+    bl_idname = "cloth_guard.clear_problem_frames"
+    bl_label = "Clear Problem Frames"
+    bl_description = "Clear the problem frames list"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        settings = _settings(context)
+        settings.problem_frames.clear()
+        settings.active_problem_frame_index = 0
+        self.report({"INFO"}, "Problem frames cleared")
+        return {"FINISHED"}
+
+
+class CG_OT_go_to_problem_frame(Operator):
+    bl_idname = "cloth_guard.go_to_problem_frame"
+    bl_label = "Go To Problem Frame"
+    bl_description = "Jump the timeline to the selected problem frame"
+    bl_options = {"REGISTER", "UNDO"}
+
+    frame: bpy.props.IntProperty(name="Frame", default=-1, min=-1)
+
+    def execute(self, context):
+        settings = _settings(context)
+        scene = context.scene
+
+        target = int(self.frame)
+        if target < 0:
+            idx = int(settings.active_problem_frame_index)
+            if idx < 0 or idx >= len(settings.problem_frames):
+                self.report({"ERROR"}, "Select a problem frame first")
+                return {"CANCELLED"}
+            target = int(settings.problem_frames[idx].frame)
+
+        scene.frame_set(target)
+        self.report({"INFO"}, f"Set frame to {target}")
+        return {"FINISHED"}
+
+
+def _bake_live_correction_to_key(garment_obj: bpy.types.Object, name: str) -> None:
+    """
+    Bake the current mixed shape (including CG_LiveCorrection) into a named shape key.
+
+    If a key with the same name exists, it is overwritten (data copied).
+    """
+    if garment_obj.type != "MESH":
+        raise RuntimeError("Garment is not a mesh")
+
+    ensure_live_correction_shapekey(garment_obj).value = 1.0
+    if garment_obj.data.shape_keys is None:
+        garment_obj.shape_key_add(name="Basis", from_mix=False)
+
+    keys = garment_obj.data.shape_keys
+    target = keys.key_blocks.get(name)
+
+    tmp = garment_obj.shape_key_add(name="CG__TMP_BAKE", from_mix=True)
+    try:
+        if target is None:
+            tmp.name = name
+            return
+        if len(tmp.data) != len(target.data):
+            raise RuntimeError("Shape key vertex count mismatch")
+        for i in range(len(tmp.data)):
+            target.data[i].co = tmp.data[i].co
+    finally:
+        kb = keys.key_blocks.get("CG__TMP_BAKE")
+        if kb is not None:
+            garment_obj.shape_key_remove(key_block=kb)
+
+
+class CG_OT_generate_correction_current_frame(Operator):
+    bl_idname = "cloth_guard.generate_correction_current_frame"
+    bl_label = "Generate Correction For Current Frame"
+    bl_description = "Update live correction and bake per-garment corrective shape keys for the current frame (non-destructive)"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        settings = _settings(context)
+        validated = _validate_assigned_meshes(settings)
+        if validated is None:
+            self.report({"ERROR"}, "Assign a valid Body mesh and add garment mesh objects to the Garments list first")
+            return {"CANCELLED"}
+        body_obj, garments = validated
+
+        frame = int(context.scene.frame_current)
+        depsgraph = context.evaluated_depsgraph_get()
+
+        view_layer = context.view_layer
+        prev_active = view_layer.objects.active
+
+        baked = 0
+        with _temporary_mode_object(context):
+            for garment_obj in garments:
+                try:
+                    correct_current_pose(
+                        garment_obj=garment_obj,
+                        body_obj=body_obj,
+                        depsgraph=depsgraph,
+                        offset_distance=settings.offset_distance,
+                        detection_radius=max(settings.offset_distance, settings.detection_radius),
+                        correction_strength=settings.correction_strength,
+                        max_push_distance=settings.max_push_distance,
+                        smooth_iterations=settings.smooth_iterations,
+                        smooth_strength=settings.smooth_strength,
+                        use_risk_area=settings.use_risk_area,
+                        preserve_pinned_areas=settings.preserve_pinned_areas,
+                    )
+                    view_layer.objects.active = garment_obj
+                    key_name = f"CG_Frame_{frame:04d}"
+                    _bake_live_correction_to_key(garment_obj, key_name)
+                    baked += 1
+                except Exception as e:
+                    self.report({"WARNING"}, f"{garment_obj.name}: bake failed: {e}")
+            settings.enable_live_anti_clip = True
+
+        view_layer.objects.active = prev_active
+        self.report({"INFO"}, f"Baked per-frame correctives on {baked} garment(s) at frame {frame}")
+        return {"FINISHED"}
+
+
+class CG_OT_generate_corrections_flagged_frames(Operator):
+    bl_idname = "cloth_guard.generate_corrections_flagged_frames"
+    bl_label = "Generate Corrections For All Flagged Frames"
+    bl_description = "For each problem frame, update live correction and bake per-garment corrective shape keys (non-destructive)"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        settings = _settings(context)
+        validated = _validate_assigned_meshes(settings)
+        if validated is None:
+            self.report({"ERROR"}, "Assign a valid Body mesh and add garment mesh objects to the Garments list first")
+            return {"CANCELLED"}
+        body_obj, garments = validated
+
+        if len(settings.problem_frames) == 0:
+            self.report({"ERROR"}, "No problem frames stored. Run Scan Animation first.")
+            return {"CANCELLED"}
+
+        scene = context.scene
+        prev_frame = int(scene.frame_current)
+
+        view_layer = context.view_layer
+        prev_active = view_layer.objects.active
+
+        frames = [int(it.frame) for it in settings.problem_frames]
+        frames = sorted(set(frames))
+
+        baked_keys = 0
+        try:
+            with _temporary_mode_object(context):
+                for frame in frames:
+                    scene.frame_set(frame)
+                    depsgraph = context.evaluated_depsgraph_get()
+                    for garment_obj in garments:
+                        try:
+                            correct_current_pose(
+                                garment_obj=garment_obj,
+                                body_obj=body_obj,
+                                depsgraph=depsgraph,
+                                offset_distance=settings.offset_distance,
+                                detection_radius=max(settings.offset_distance, settings.detection_radius),
+                                correction_strength=settings.correction_strength,
+                                max_push_distance=settings.max_push_distance,
+                                smooth_iterations=settings.smooth_iterations,
+                                smooth_strength=settings.smooth_strength,
+                                use_risk_area=settings.use_risk_area,
+                                preserve_pinned_areas=settings.preserve_pinned_areas,
+                            )
+                            view_layer.objects.active = garment_obj
+                            key_name = f"CG_Frame_{frame:04d}"
+                            _bake_live_correction_to_key(garment_obj, key_name)
+                            baked_keys += 1
+                        except Exception as e:
+                            self.report({"WARNING"}, f"{garment_obj.name} @ {frame}: bake failed: {e}")
+                settings.enable_live_anti_clip = True
+        finally:
+            scene.frame_set(prev_frame)
+            view_layer.objects.active = prev_active
+
+        self.report({"INFO"}, f"Generated per-frame correctives: {len(frames)} frame(s), {baked_keys} baked key(s)")
+        return {"FINISHED"}
+
+
 class CG_OT_refresh_live_correction(Operator):
     bl_idname = "cloth_guard.refresh_live_correction"
     bl_label = "Refresh Live Correction"
