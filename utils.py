@@ -409,6 +409,8 @@ class PoseCorrectionStats:
     checked_verts: int
     corrected_verts: int
     min_nearest_distance: float | None
+    changed_verts: int
+    max_delta_distance: float
 
 
 def correct_current_pose(
@@ -472,6 +474,16 @@ def correct_current_pose(
         corrected = 0
         nearest_distances: list[float | None] = [None] * len(garment_mesh.vertices)
 
+        def _choose_outward_normal(point_body: Vector, normal_body: Vector) -> Vector:
+            n = normal_body.normalized()
+            # Pick the direction that increases distance from body most (handles flipped normals).
+            test_step = max(1e-6, offset_distance * 0.25)
+            d_pos = bvh_body.find_nearest(point_body + n * test_step)
+            d_neg = bvh_body.find_nearest(point_body - n * test_step)
+            dist_pos = float(d_pos[3]) if d_pos is not None and d_pos[3] is not None else 0.0
+            dist_neg = float(d_neg[3]) if d_neg is not None and d_neg[3] is not None else 0.0
+            return n if dist_pos >= dist_neg else (-n)
+
         for i, v in enumerate(garment_mesh.vertices):
             if risk_idx is not None and _vertex_weight(base_mesh.vertices[i], risk_idx) <= 0.0:
                 continue
@@ -491,17 +503,22 @@ def correct_current_pose(
                 continue
 
             vec = garment_in_body - nearest_co
-            dot = vec.dot(nearest_no) if nearest_no is not None else vec.length
-            inside = nearest_no is not None and dot < -penetration_eps
+            if nearest_no is not None:
+                outward_no = _choose_outward_normal(garment_in_body, nearest_no)
+                signed = float(vec.dot(outward_no))
+                inside = signed < -penetration_eps
+                push_dir_body = outward_no
+            else:
+                signed = float(vec.length)
+                inside = False
+                push_dir_body = vec.normalized() if vec.length > 1e-12 else Vector((0.0, 0.0, 1.0))
 
             if inside:
-                push_amount = offset_distance + (-dot)
-                push_dir_body = nearest_no
+                push_amount = offset_distance + (-signed)
             else:
                 if dist >= offset_distance:
                     continue
                 push_amount = offset_distance - dist
-                push_dir_body = vec.normalized() if vec.length > 1e-12 else (nearest_no if nearest_no is not None else Vector((0.0, 0.0, 1.0)))
 
             if max_push_distance > 0.0:
                 push_amount = min(push_amount, max_push_distance)
@@ -551,15 +568,29 @@ def correct_current_pose(
             strength=float(smooth_strength),
         )
 
+        # Compute delta stats after smoothing (what will be written to the shape key).
+        changed = 0
+        max_delta = 0.0
+        mw3 = garment_obj.matrix_world.to_3x3()
+        for d in deltas:
+            ln = float(d.length)
+            if ln > 1e-12:
+                changed += 1
+                wd = mw3 @ d
+                max_delta = max(max_delta, float(wd.length))
+
         live = ensure_live_correction_shapekey(garment_obj)
         basis = garment_obj.data.shape_keys.key_blocks[0]
         for i in range(len(base_mesh.vertices)):
             live.data[i].co = basis.data[i].co + deltas[i]
+        live.value = 1.0
 
         return PoseCorrectionStats(
             checked_verts=checked,
             corrected_verts=corrected,
             min_nearest_distance=_safe_min(nearest_distances),
+            changed_verts=changed,
+            max_delta_distance=max_delta,
         )
     finally:
         body_eval.to_mesh_clear()

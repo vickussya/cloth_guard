@@ -39,6 +39,8 @@ from .utils import (
     write_weights_to_vertex_group,
 )
 
+# NOTE: Keep operator ids under the `cloth_guard.*` namespace (AGENTS.md).
+
 
 def _settings(context):
     return context.scene.cg_settings
@@ -115,6 +117,24 @@ def _validate_assigned_meshes(settings):
     if not garments:
         return None
     return body_obj, garments
+
+
+def _shapekey_delta_stats(*, garment_obj: bpy.types.Object, shapekey_name: str) -> tuple[int, float]:
+    if garment_obj.data.shape_keys is None:
+        return 0, 0.0
+    kb = garment_obj.data.shape_keys.key_blocks.get(shapekey_name)
+    basis = garment_obj.data.shape_keys.key_blocks[0]
+    if kb is None or len(kb.data) != len(basis.data):
+        return 0, 0.0
+    changed = 0
+    max_delta = 0.0
+    for i in range(len(kb.data)):
+        d = kb.data[i].co - basis.data[i].co
+        ln = float(d.length)
+        if ln > 1e-12:
+            changed += 1
+            max_delta = max(max_delta, ln)
+    return changed, max_delta
 
 
 class CG_OT_add_selected_garments(Operator):
@@ -571,6 +591,15 @@ class CG_OT_correct_current_pose(Operator):
                         if global_min is None
                         else min(global_min, s.min_nearest_distance)
                     )
+                print(
+                    "[Cloth Guard][Correct]",
+                    garment_obj.name,
+                    f"frame={context.scene.frame_current}",
+                    f"clipping={int(s.flagged_clipping)}",
+                    f"corrected={stats.corrected_verts}",
+                    f"changed={stats.changed_verts}",
+                    f"max_delta={stats.max_delta_distance:.6f} m",
+                )
 
             settings.enable_live_anti_clip = True
             global_min_txt = f"{global_min:.6f} m" if global_min is not None else "n/a"
@@ -776,6 +805,26 @@ def _bake_live_correction_to_key(garment_obj: bpy.types.Object, name: str) -> No
             garment_obj.shape_key_remove(key_block=kb)
 
 
+def _keyframe_shapekey_value(*, garment_obj: bpy.types.Object, key_name: str, frame: int, value: float) -> None:
+    if garment_obj.data.shape_keys is None:
+        return
+    kb = garment_obj.data.shape_keys.key_blocks.get(key_name)
+    if kb is None:
+        return
+    kb.value = float(value)
+    kb.keyframe_insert("value", frame=int(frame))
+    ad = garment_obj.data.shape_keys.animation_data
+    if ad is None or ad.action is None:
+        return
+    data_path = f'key_blocks["{kb.name}"].value'
+    fc = ad.action.fcurves.find(data_path=data_path)
+    if fc is None:
+        return
+    for kp in fc.keyframe_points:
+        if int(round(kp.co.x)) == int(frame):
+            kp.interpolation = "CONSTANT"
+
+
 class CG_OT_generate_correction_current_frame(Operator):
     bl_idname = "cloth_guard.generate_correction_current_frame"
     bl_label = "Generate Correction For Current Frame"
@@ -800,7 +849,15 @@ class CG_OT_generate_correction_current_frame(Operator):
         with _temporary_mode_object(context):
             for garment_obj in garments:
                 try:
-                    correct_current_pose(
+                    det = detect_clipping(
+                        garment_obj=garment_obj,
+                        body_obj=body_obj,
+                        depsgraph=depsgraph,
+                        offset_distance=settings.offset_distance,
+                        detection_radius=max(settings.offset_distance, settings.detection_radius),
+                        use_risk_area=settings.use_risk_area,
+                    )
+                    stats = correct_current_pose(
                         garment_obj=garment_obj,
                         body_obj=body_obj,
                         depsgraph=depsgraph,
@@ -813,9 +870,26 @@ class CG_OT_generate_correction_current_frame(Operator):
                         use_risk_area=settings.use_risk_area,
                         preserve_pinned_areas=settings.preserve_pinned_areas,
                     )
+                    if stats.changed_verts <= 0 or stats.max_delta_distance <= 1e-10:
+                        self.report({"INFO"}, f"{garment_obj.name}: no correction delta generated at frame {frame}")
+                        continue
                     view_layer.objects.active = garment_obj
                     key_name = f"CG_Frame_{frame:04d}"
                     _bake_live_correction_to_key(garment_obj, key_name)
+                    _keyframe_shapekey_value(garment_obj=garment_obj, key_name=key_name, frame=frame - 1, value=0.0)
+                    _keyframe_shapekey_value(garment_obj=garment_obj, key_name=key_name, frame=frame, value=1.0)
+                    _keyframe_shapekey_value(garment_obj=garment_obj, key_name=key_name, frame=frame + 1, value=0.0)
+                    changed, max_d = _shapekey_delta_stats(garment_obj=garment_obj, shapekey_name=key_name)
+                    print(
+                        "[Cloth Guard][BakeFrame]",
+                        garment_obj.name,
+                        f"frame={frame}",
+                        f"clipping={int(det.stats.flagged_clipping)}",
+                        f"corrected={stats.corrected_verts}",
+                        f"delta_verts={changed}",
+                        f"max_delta={max_d:.6f}",
+                        f"key={key_name}",
+                    )
                     baked += 1
                 except Exception as e:
                     self.report({"WARNING"}, f"{garment_obj.name}: bake failed: {e}")
@@ -861,7 +935,15 @@ class CG_OT_generate_corrections_flagged_frames(Operator):
                     depsgraph = context.evaluated_depsgraph_get()
                     for garment_obj in garments:
                         try:
-                            correct_current_pose(
+                            det = detect_clipping(
+                                garment_obj=garment_obj,
+                                body_obj=body_obj,
+                                depsgraph=depsgraph,
+                                offset_distance=settings.offset_distance,
+                                detection_radius=max(settings.offset_distance, settings.detection_radius),
+                                use_risk_area=settings.use_risk_area,
+                            )
+                            stats = correct_current_pose(
                                 garment_obj=garment_obj,
                                 body_obj=body_obj,
                                 depsgraph=depsgraph,
@@ -874,9 +956,26 @@ class CG_OT_generate_corrections_flagged_frames(Operator):
                                 use_risk_area=settings.use_risk_area,
                                 preserve_pinned_areas=settings.preserve_pinned_areas,
                             )
+                            if stats.changed_verts <= 0 or stats.max_delta_distance <= 1e-10:
+                                print("[Cloth Guard][BakeFlagged]", garment_obj.name, f"frame={frame}", "NO_DELTA")
+                                continue
                             view_layer.objects.active = garment_obj
                             key_name = f"CG_Frame_{frame:04d}"
                             _bake_live_correction_to_key(garment_obj, key_name)
+                            _keyframe_shapekey_value(garment_obj=garment_obj, key_name=key_name, frame=frame - 1, value=0.0)
+                            _keyframe_shapekey_value(garment_obj=garment_obj, key_name=key_name, frame=frame, value=1.0)
+                            _keyframe_shapekey_value(garment_obj=garment_obj, key_name=key_name, frame=frame + 1, value=0.0)
+                            changed, max_d = _shapekey_delta_stats(garment_obj=garment_obj, shapekey_name=key_name)
+                            print(
+                                "[Cloth Guard][BakeFlagged]",
+                                garment_obj.name,
+                                f"frame={frame}",
+                                f"clipping={int(det.stats.flagged_clipping)}",
+                                f"corrected={stats.corrected_verts}",
+                                f"delta_verts={changed}",
+                                f"max_delta={max_d:.6f}",
+                                f"key={key_name}",
+                            )
                             baked_keys += 1
                         except Exception as e:
                             self.report({"WARNING"}, f"{garment_obj.name} @ {frame}: bake failed: {e}")
@@ -961,6 +1060,23 @@ class CG_OT_create_corrective_shapekey(Operator):
         with _temporary_mode_object(context):
             ensure_live_correction_shapekey(garment_obj)
             settings.enable_live_anti_clip = True
+            # Update live correction now so the baked corrective isn't empty.
+            depsgraph = context.evaluated_depsgraph_get()
+            stats = correct_current_pose(
+                garment_obj=garment_obj,
+                body_obj=settings.body_object,
+                depsgraph=depsgraph,
+                offset_distance=settings.offset_distance,
+                detection_radius=max(settings.offset_distance, settings.detection_radius),
+                correction_strength=settings.correction_strength,
+                max_push_distance=settings.max_push_distance,
+                smooth_iterations=settings.smooth_iterations,
+                smooth_strength=settings.smooth_strength,
+                use_risk_area=settings.use_risk_area,
+                preserve_pinned_areas=settings.preserve_pinned_areas,
+            )
+            if stats.changed_verts <= 0 or stats.max_delta_distance <= 1e-10:
+                self.report({"WARNING"}, "No correction delta generated for this pose; corrective shape key may be empty")
 
         view_layer = context.view_layer
         prev_active = view_layer.objects.active
@@ -979,6 +1095,11 @@ class CG_OT_create_corrective_shapekey(Operator):
             view_layer.objects.active = prev_active
 
         new_key.value = 1.0
+        changed, max_d = _shapekey_delta_stats(garment_obj=garment_obj, shapekey_name=new_key.name)
+        if changed <= 0 or max_d <= 1e-12:
+            self.report({"WARNING"}, f"Corrective created but appears empty: {new_key.name}")
+        else:
+            self.report({"INFO"}, f"{new_key.name} changed {changed} verts; max delta {max_d:.6f} m")
 
         if settings.driver_enable:
             try:
@@ -998,7 +1119,7 @@ class CG_OT_create_corrective_shapekey(Operator):
             except Exception as e:
                 self.report({"WARNING"}, f"Corrective created, but driver linking failed: {e}")
 
-        self.report({"INFO"}, f"Corrective shape key created: {new_key.name}")
+        print("[Cloth Guard][Corrective]", garment_obj.name, f"frame={context.scene.frame_current}", f"key={new_key.name}", f"delta_verts={changed}", f"max_delta={max_d:.6f}")
         return {"FINISHED"}
 
 
