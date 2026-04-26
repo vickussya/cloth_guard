@@ -44,6 +44,7 @@ from .utils import (
 
 # NOTE: Keep operator ids under the `cloth_guard.*` namespace (AGENTS.md).
 
+_NON_DESTRUCTIVE_MSG = "Cloth Guard is non-destructive: it does not change topology or vertex order."
 
 _TOPOLOGY_MODIFIER_TYPES = {
     # Common topology-changing modifiers
@@ -228,7 +229,8 @@ class CG_OT_check_garment_compatibility(Operator):
                     {"WARNING"},
                     "Some garments have topology-changing modifiers (topology mismatch). "
                     "Cloth Guard will use a non-destructive helper/modifier workflow for those garments. "
-                    "Enable 'Use Cage Mode For Topology-Changing Garments' for best results. See console for details.",
+                    "Enable 'Use Cage Mode For Topology-Changing Garments' for best results. See console for details. "
+                    + _NON_DESTRUCTIVE_MSG,
                 )
             else:
                 self.report({"INFO"}, f"All garments OK for corrective shape keys ({len(garments)} checked). See console for details.")
@@ -773,7 +775,7 @@ class CG_OT_correct_current_pose(Operator):
                             global_min = s.min_nearest_distance if global_min is None else min(global_min, s.min_nearest_distance)
                         self.report(
                             {"INFO"},
-                            f"{garment_obj.name}: topology-changing modifiers detected; using helper/modifier correction mode",
+                            f"{garment_obj.name}: topology-changing modifiers detected; using helper/modifier correction mode. {_NON_DESTRUCTIVE_MSG}",
                         )
                     except Exception as e:
                         self.report({"ERROR"}, f"{garment_obj.name}: helper/modifier correction failed: {e}")

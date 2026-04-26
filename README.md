@@ -90,6 +90,14 @@ For extreme poses (raised arms, torso twists), automated anti-clip deformation m
   - **Shape-key correction** (best when topology is stable): used when evaluated vertex count matches the base mesh.
   - **Helper/modifier correction** (for live modifier stacks): used automatically when topology-changing modifiers are present (Subdivision/Geometry Nodes/etc.). This keeps the stack non-destructive and animator-friendly.
 
+## Non-destructive guarantee
+
+Cloth Guard is designed to be **non-destructive to mesh topology and vertex order**:
+
+- It never adds/removes/reorders vertices or faces.
+- It never applies/collapses modifier stacks.
+- It only uses deformation layers: vertex groups, shape keys, and deformation modifiers (e.g. Shrinkwrap / smoothing) that preserve topology.
+
 ## License
 
 This project is licensed under the **GNU General Public License v3.0 (GPL-3.0)**. See `LICENSE`.
