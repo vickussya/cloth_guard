@@ -2,37 +2,23 @@
 
 Post-animation garment cleanup for Blender: preserve stylized clothing shapes and reduce body clipping without cloth simulation.
 
-**Cloth Guard** is a production-friendly, non-simulation toolset for keeping rigged clothing closer to its designed silhouette during character animation, while minimizing (as much as realistically possible) clipping into the body.
+## What Cloth Guard Does
 
-## What problem it solves
+Cloth Guard is a post-animation cleanup tool for animators and character artists.
 
-Rigged garments often look good in a rest pose but clip into the character during posing and animation playback. Cloth simulation is not always practical in production (time, stability, art direction, iteration speed). Cloth Guard provides animator-friendly helpers to:
+It helps with two common problems:
 
-- Hide body geometry that is under clothing (body masking)
-- Detect risky/clipping garment areas
-- Apply gentle anti-clip deformation (non-simulation) with optional smoothing
-- Bake corrections into corrective shape keys for difficult poses
+1. **Shape Preservation / Stabilization**  
+   Keeps stylized garments looking clean during animation by reducing ugly deformation noise (pinching, collapsing, messy wrinkles).
 
-## Key features (MVP)
+2. **Anti-Clipping / Post-Animation Cleanup**  
+   Reduces body-through-clothing intersections and gives you tools to hide small remaining intersections.
 
-- **Multi-garment workflow**: assign a Body mesh and add multiple garment mesh objects
-- **Body masking**: generate a vertex-group-driven Mask modifier on the body for hiding regions under the garment
-- **Clipping/contact detection**: create/update `CG_Contact` (near-body) and `CG_Clipping` (likely penetration) vertex groups per garment
-- **Post-animation cleanup**: scan a frame range to find problem frames, then jump to and fix only those frames
-- **Non-destructive correction**: generates/updates a live corrective shape key (`CG_LiveCorrection`) instead of modifying the base mesh
-- **Shape preservation / stabilization**: store a clean rest/reference shape and generate a live preservation corrective (`CG_LivePreserve`) to reduce unwanted deformation wrinkles while keeping pose deformation
-- **Risk/control groups**: optional vertex groups (Risk, Pinned, Preserve Collar/Hem/Seams)
-- **Corrective shape keys**: bake the current corrected state into a named shape key; optional bone-rotation driver linking (MVP)
-- **Per-frame baking**: bake non-destructive per-frame correctives (shape keys) for current frame or for all flagged frames
-- **Live anti-clip toggle**: enable/disable `CG_LiveCorrection` quickly while reviewing
+Cloth Guard is not a magic one-click cloth solver. It does not replace proper rigging, weight painting, or cloth simulation in every case.
 
 ## Supported Blender version
 
-- **Blender 3.0+** (minimum)
-
-## Repository layout
-
-This repository is structured so the GitHub **Code -> Download ZIP** archive can be installed directly in Blender.
+- Blender **3.0+**
 
 ## Installation
 
@@ -40,72 +26,100 @@ This repository is structured so the GitHub **Code -> Download ZIP** archive can
 2. In Blender: `Edit` -> `Preferences` -> `Add-ons` -> `Install...`
 3. Select the downloaded ZIP, then enable **Cloth Guard**.
 
-## Quick start workflow
+## Recommended Basic Workflow
 
-1. Select your **Body** and **Garment** mesh objects.
-2. Open the 3D Viewport sidebar: `N` -> **Cloth Guard** tab.
-3. Assign **Body Object** and add garments to the **Garments** list (select garments in the viewport, then click **+**).
+1. **Save a copy** of your Blender file (always keep a backup).
+2. Assign **Body Object**.
+3. Add one or more **Garment Objects** (select garments in the viewport, then click **Add Selected Garment(s)**).
 4. Click **Setup Cloth Guard**.
-5. Click **Create Body Mask** to hide body parts under the garment.
-6. (Optional) Click **Detect Clipping** to visualize `CG_Contact` / `CG_Clipping` on the current frame.
-7. Use **Post-Animation Cleanup**:
-   - Set Start/End/Step and click **Scan Animation**
-   - Select a flagged frame and click **Go To Problem Frame**
-   - Click **Update Live Corrective** to preview a non-destructive fix (`CG_LiveCorrection`)
-   - Click **Generate Correction (Current)** or **Generate Corrections (All Flagged)** to bake per-frame shape keys
-8. For artist-authored fixes, click **Create Corrective Shape Key From Current Pose**, name it, and optionally link it to a bone rotation.
+5. Go to a clean frame where the garment looks correct and click **Store Rest Shape**.
+6. Set **Start Frame** and **End Frame**.
+7. Click **Scan Animation**.
+8. Review the **problem frames** list and jump to them.
+9. Use **Shape Preservation first** if the garment loses its form.
+10. Use **Anti-Clipping** after shape preservation if the body intersects the clothing.
+11. Scrub the timeline and review. If the result is too strong, lower settings and regenerate.
 
-## Shape preservation (what it does)
+## Shape Preservation Workflow (Garment Stabilization)
 
-Shape preservation is designed for stylized/clean garments that should keep a designed form during animation:
+Use this when the garment gets ugly wrinkles, collapses, shrinks, or loses its designed silhouette.
 
-- **Store Rest Shape** captures a clean reference (e.g. your ideal rest pose form).
-- **Analyze Shape Drift** writes `CG_ShapeDrift` to visualize areas that distort beyond a threshold.
-- **Preserve Shape (Current)** generates `CG_LivePreserve` to reduce high-frequency “wrinkle noise” while still following the animation (it does **not** try to restore the garment back to a rest pose).
+1. Go to a clean frame where the garment looks correct.
+2. Click **Store Rest Shape**.
+3. Go to a problem frame.
+4. Click **Analyze Shape Drift**.
+5. Click **Preserve Shape (Current)**.
+6. Check if the garment keeps its form better.
+7. If it overcorrects, lower **Shape Strength** or **Wrinkle Smooth Strength** and try again.
 
-## Body masking (what it does)
+Notes:
 
-Body masking helps reduce visible "body poking through cloth" by hiding body geometry that is sufficiently close to the garment. Cloth Guard:
+- Shape preservation is meant to remove deformation noise. It should not freeze the garment or force it back to a rest pose.
 
-- Creates/updates a body vertex group (`CG_BodyMask`)
-- Creates/updates a **Mask** modifier on the body and **inverts** it so the vertex group represents hidden regions
+## Anti-Clipping Workflow (Body Intersections)
 
-This is a visibility/cleanup workflow - it does not physically push the cloth away, but it often removes the most distracting clipping artifacts.
+Use this when the body intersects through the clothing.
 
-## Current-pose correction (what it does)
+1. Go to a frame with visible clipping.
+2. Click **Detect Clipping**.
+3. Click **Select** to inspect the detected vertices.
+4. Click **Generate Correction (Current)**.
+5. Check if clipping is reduced.
+6. If small body intersections remain under the garment, click **Create Body Mask**.
+7. If you need to remove it, click **Delete Body Mask**.
 
-Cloth Guard's MVP anti-clip correction is intentionally **non-simulation**:
+## Combined Workflow (Recommended Order)
 
-- It computes contact/clipping weights (`CG_Contact` / `CG_Clipping`) using closest-surface distance plus a penetration heuristic
-- It writes deltas into a live shape key (`CG_LiveCorrection`) so the correction is **non-destructive** and can be disabled instantly
+Combined cleanup workflow:
 
-This aims for **small, predictable fixes** rather than aggressive "perfect collisions".
+1. Store Rest Shape on a clean frame.
+2. Scan Animation.
+3. Go to a problem frame.
+4. If the garment shape is distorted, run **Preserve Shape (Current)** first.
+5. Then run **Detect Clipping**.
+6. Use **Select** to check detected clipping areas.
+7. Run **Generate Correction (Current)**.
+8. If tiny body intersections remain under the garment, run **Create Body Mask**.
+9. Scrub the timeline and review the result.
+10. If the result is too strong, lower the settings and regenerate.
 
-## Corrective shape keys (what they do)
+Why this order:
 
-For extreme poses (raised arms, torso twists), automated anti-clip deformation may not be enough. Cloth Guard supports baking the current corrected state into a named shape key, so artists can:
+- Shape preservation cleans the garment form first.
+- Anti-clipping fixes remaining body intersections second.
+- Body mask hides small remaining body penetration under the garment as a final fallback.
 
-- Keep a stable designed silhouette
-- Author pose-specific fixes
-- Drive correctives from bone rotation ranges (MVP)
+## Batch Workflow
 
-## Limitations (important)
+Once current-frame results look good, you can batch:
 
-- Cloth Guard is **not** a physics cloth simulation replacement.
-- It will not produce perfect collision in all scenarios (dense layering, extreme deformation, very thin offsets).
-- Extreme poses may still require manual corrective keys and/or careful weight painting of control groups.
-- Best results are typically achieved with stylized or art-directed garments where you want controlled shapes.
-- **Two correction modes**:
-  - **Shape-key correction** (best when topology is stable): used when evaluated vertex count matches the base mesh.
-  - **Helper/modifier correction** (for live modifier stacks): used automatically when topology-changing modifiers are present (Subdivision/Geometry Nodes/etc.). This keeps the stack non-destructive and animator-friendly.
+- **Preserve Shape (All Flagged Frames)**
+- **Generate Corrections (All Flagged Frames)**
+
+Tip: test on a short range first (for example **1–30**) before running batch on a full shot.
+
+## Recommended Testing Workflow
+
+- Duplicate the garment and test on the duplicate first.
+- Hide the original garment.
+- Test on a short frame range.
+- Change only one setting at a time.
+
+## Important Limitations
+
+- Not a perfect automatic cloth solver.
+- Best results come from clean topology and decent rigging/weights.
+- Extreme poses may still need manual corrective edits.
+- Shape preservation should not freeze the cloth.
+- Anti-clipping should reduce clipping, not destroy the silhouette.
 
 ## Non-destructive guarantee
 
-Cloth Guard is designed to be **non-destructive to mesh topology and vertex order**:
+Cloth Guard is designed to be non-destructive to mesh topology and vertex order:
 
 - It never adds/removes/reorders vertices or faces.
 - It never applies/collapses modifier stacks.
-- It only uses deformation layers: vertex groups, shape keys, and deformation modifiers (e.g. Shrinkwrap / smoothing) that preserve topology.
+- It only uses deformation layers (vertex groups, shape keys, deformation modifiers) that preserve topology.
 
 ## License
 

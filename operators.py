@@ -601,7 +601,7 @@ class CG_OT_remove_setup(Operator):
 class CG_OT_create_body_mask(Operator):
     bl_idname = "cloth_guard.create_body_mask"
     bl_label = "Create Body Mask"
-    bl_description = "Create/update a Mask modifier on the body to hide regions under the garment"
+    bl_description = "Hides body areas under the garment to remove small remaining intersections"
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
@@ -689,7 +689,7 @@ class CG_OT_create_body_mask(Operator):
 class CG_OT_delete_body_mask(Operator):
     bl_idname = "cloth_guard.delete_body_mask"
     bl_label = "Delete Body Mask"
-    bl_description = "Remove Cloth Guard's body mask vertex group and Mask modifier (restores body visibility)"
+    bl_description = "Removes the Cloth Guard body mask and restores hidden body areas"
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
@@ -729,7 +729,7 @@ class CG_OT_delete_body_mask(Operator):
 class CG_OT_store_rest_shape(Operator):
     bl_idname = "cloth_guard.store_rest_shape"
     bl_label = "Store Rest Shape"
-    bl_description = "Store a clean reference garment shape (CG_RestShape) for shape preservation analysis/correctives"
+    bl_description = "Stores the clean garment form used as reference for shape preservation"
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
@@ -766,7 +766,7 @@ class CG_OT_store_rest_shape(Operator):
 class CG_OT_analyze_shape_drift(Operator):
     bl_idname = "cloth_guard.analyze_shape_drift"
     bl_label = "Analyze Shape Drift"
-    bl_description = "Analyze drift from stored rest shape and write a CG_ShapeDrift vertex group for visualization"
+    bl_description = "Checks how much the garment shape has changed from the stored reference"
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
@@ -819,7 +819,7 @@ class CG_OT_analyze_shape_drift(Operator):
 class CG_OT_generate_shape_preservation_current(Operator):
     bl_idname = "cloth_guard.generate_shape_preservation_current"
     bl_label = "Preserve Shape (Current Frame)"
-    bl_description = "Generate a non-destructive live shape preservation corrective (CG_LivePreserve) for the current frame"
+    bl_description = "Creates a non-destructive correction to reduce unwanted deformation on the current frame"
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
@@ -874,7 +874,7 @@ class CG_OT_generate_shape_preservation_current(Operator):
 class CG_OT_generate_shape_preservation_flagged(Operator):
     bl_idname = "cloth_guard.generate_shape_preservation_flagged"
     bl_label = "Preserve Shape (All Flagged Frames)"
-    bl_description = "For each flagged frame, generate shape preservation and bake it (non-destructive)"
+    bl_description = "Batch: creates non-destructive shape preservation corrections for all flagged frames"
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
@@ -965,7 +965,7 @@ class CG_OT_generate_shape_preservation_flagged(Operator):
 class CG_OT_detect_clipping(Operator):
     bl_idname = "cloth_guard.detect_clipping"
     bl_label = "Detect Clipping"
-    bl_description = "Detect garment vertices too close to the body and store results in CG_Clipping"
+    bl_description = "Finds garment vertices that are likely intersecting or too close to the body"
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
@@ -1259,7 +1259,7 @@ class CG_OT_clear_live_correction(Operator):
 class CG_OT_scan_animation(Operator):
     bl_idname = "cloth_guard.scan_animation"
     bl_label = "Scan Animation"
-    bl_description = "Scan a frame range to find frames with likely garment/body penetration (post-animation cleanup)"
+    bl_description = "Scans the selected frame range and lists frames where clipping is detected"
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
@@ -1437,7 +1437,7 @@ def _keyframe_shapekey_value(*, garment_obj: bpy.types.Object, key_name: str, fr
 class CG_OT_generate_correction_current_frame(Operator):
     bl_idname = "cloth_guard.generate_correction_current_frame"
     bl_label = "Generate Correction For Current Frame"
-    bl_description = "Update live correction and bake per-garment corrective shape keys for the current frame (non-destructive)"
+    bl_description = "Creates a non-destructive anti-clipping correction for the current frame"
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
@@ -1534,7 +1534,7 @@ class CG_OT_generate_correction_current_frame(Operator):
 class CG_OT_generate_corrections_flagged_frames(Operator):
     bl_idname = "cloth_guard.generate_corrections_flagged_frames"
     bl_label = "Generate Corrections For All Flagged Frames"
-    bl_description = "For each problem frame, update live correction and bake per-garment corrective shape keys (non-destructive)"
+    bl_description = "Batch: creates non-destructive anti-clipping corrections for all flagged frames"
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
