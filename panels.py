@@ -36,6 +36,9 @@ class CG_UL_garments(UIList):
             try:
                 keys = item.object.data.shape_keys
                 has_rest = keys is not None and keys.key_blocks.get("CG_RestShape") is not None
+                if not has_rest:
+                    mod = item.object.modifiers.get("CG_ShapePreserve")
+                    has_rest = mod is not None and bool(getattr(mod, "is_bind", False))
             except Exception:
                 has_rest = False
             row.label(text=("Rest: Stored" if has_rest else "Rest: Missing"), icon=("CHECKMARK" if has_rest else "ERROR"))

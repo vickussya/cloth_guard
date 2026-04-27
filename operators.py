@@ -25,11 +25,13 @@ from .utils import (
     CG_MOD_BODY_MASK,
     CG_MOD_ANTICLIP,
     CG_MOD_SMOOTH,
+    CG_MOD_SHAPE_PRESERVE,
     CG_VG_BODY_MASK,
     CG_VG_CONTACT,
     CG_VG_CLIPPING,
     CG_SHAPEKEY_LIVE,
     CG_VG_SHAPE_DRIFT,
+    CG_VG_SHAPE_PRESERVE,
     CG_SHAPEKEY_REST,
     CG_SHAPEKEY_LIVE_PRESERVE,
     add_shapekey_driver_rotation_range,
@@ -42,11 +44,13 @@ from .utils import (
     ensure_live_correction_shapekey,
     ensure_live_preserve_shapekey,
     ensure_rest_shape_shapekey,
+    ensure_shape_preserve_modifier,
     ensure_vertex_group,
     is_mesh_object,
     store_rest_shape,
     analyze_shape_drift,
     generate_shape_preservation,
+    compute_shape_preserve_mask_weights,
     write_weights_to_vertex_group,
 )
 
@@ -747,15 +751,50 @@ class CG_OT_store_rest_shape(Operator):
             stored = 0
             for garment_obj in garments:
                 try:
-                    # Store rest using a topology-stable cage evaluation if needed.
                     mismatch = _topology_mismatch(garment_obj=garment_obj, depsgraph=depsgraph)
-                    mods = _likely_topology_modifiers(garment_obj) if mismatch else []
-                    with _temporarily_disable_modifiers(garment_obj, mods):
-                        if mods:
-                            context.view_layer.update()
-                            depsgraph = context.evaluated_depsgraph_get()
-                        ensure_rest_shape_shapekey(garment_obj)
-                        written = store_rest_shape(garment_obj=garment_obj, depsgraph=depsgraph)
+
+                    if mismatch:
+                        # Topology-changing stack: store the VISUAL reference by binding a post-stack Corrective Smooth.
+                        weights = compute_shape_preserve_mask_weights(
+                            garment_obj,
+                            protect_groups=bool(settings.protect_preserve_groups),
+                        )
+                        write_weights_to_vertex_group(garment_obj, CG_VG_SHAPE_PRESERVE, weights)
+
+                        mod = ensure_shape_preserve_modifier(
+                            garment_obj,
+                            iterations=int(settings.wrinkle_smoothing_iterations),
+                            factor=0.0,
+                        )
+                        if hasattr(mod, "vertex_group"):
+                            mod.vertex_group = CG_VG_SHAPE_PRESERVE
+
+                        # Bind uses the current evaluated visual shape (including Subdivision/Geo Nodes).
+                        view_layer = context.view_layer
+                        prev_active = view_layer.objects.active
+                        prev_sel = garment_obj.select_get()
+                        view_layer.objects.active = garment_obj
+                        try:
+                            garment_obj.select_set(True)
+                            if hasattr(bpy.ops.object, "correctivesmooth_bind"):
+                                bpy.ops.object.correctivesmooth_bind(modifier=mod.name)
+                            elif hasattr(mod, "is_bind"):
+                                mod.is_bind = True
+                        finally:
+                            try:
+                                garment_obj.select_set(prev_sel)
+                            except Exception:
+                                pass
+                            view_layer.objects.active = prev_active
+
+                        stored += 1
+                        self.report({"INFO"}, f"Stored rest shape for {garment_obj.name}: visual bind (post-modifiers)")
+                        print("[Cloth Guard][RestBind]", garment_obj.name, "modifier", mod.name)
+                        continue
+
+                    # Topology-stable: store an exact per-vertex rest shape key.
+                    ensure_rest_shape_shapekey(garment_obj)
+                    written = store_rest_shape(garment_obj=garment_obj, depsgraph=depsgraph)
                     stored += 1
                     self.report({"INFO"}, f"Stored rest shape for {garment_obj.name}: {written} vertices")
                     print("[Cloth Guard][Rest]", garment_obj.name, f"written={written}")
@@ -786,17 +825,20 @@ class CG_OT_analyze_shape_drift(Operator):
             for garment_obj in garments:
                 try:
                     mismatch = _topology_mismatch(garment_obj=garment_obj, depsgraph=depsgraph)
-                    mods = _likely_topology_modifiers(garment_obj) if mismatch else []
-                    with _temporarily_disable_modifiers(garment_obj, mods):
-                        if mods:
-                            context.view_layer.update()
-                            depsgraph = context.evaluated_depsgraph_get()
-                        stats, weights = analyze_shape_drift(
-                            garment_obj=garment_obj,
-                            depsgraph=depsgraph,
-                            drift_threshold=settings.drift_threshold,
-                            protect_borders=settings.protect_borders,
+                    if mismatch:
+                        self.report(
+                            {"INFO"},
+                            f"{garment_obj.name}: drift analysis is not available in visual modifier mode. "
+                            "Use Preserve Shape (Current) to preview, or use the mask group to protect areas.",
                         )
+                        continue
+
+                    stats, weights = analyze_shape_drift(
+                        garment_obj=garment_obj,
+                        depsgraph=depsgraph,
+                        drift_threshold=settings.drift_threshold,
+                        protect_borders=settings.protect_borders,
+                    )
                     write_weights_to_vertex_group(garment_obj, CG_VG_SHAPE_DRIFT, weights)
                     analyzed += 1
                     avg_txt = f"{stats.avg_flagged_drift:.6f} m" if stats.avg_flagged_drift is not None else "n/a"
@@ -804,12 +846,7 @@ class CG_OT_analyze_shape_drift(Operator):
                         {"INFO"},
                         f"{garment_obj.name}: drift flagged {stats.flagged_verts}/{stats.checked_verts}; max {stats.max_drift_distance:.6f} m; avg {avg_txt}",
                     )
-                    print(
-                        "[Cloth Guard][Drift]",
-                        garment_obj.name,
-                        f"flagged={stats.flagged_verts}",
-                        f"max={stats.max_drift_distance:.6f}",
-                    )
+                    print("[Cloth Guard][Drift]", garment_obj.name, f"flagged={stats.flagged_verts}", f"max={stats.max_drift_distance:.6f}")
                 except Exception as e:
                     self.report({"WARNING"}, f"{garment_obj.name}: drift analysis failed: {e}")
 
@@ -841,31 +878,44 @@ class CG_OT_generate_shape_preservation_current(Operator):
             failed = 0
             for garment_obj in garments:
                 try:
+                    mismatch = _topology_mismatch(garment_obj=garment_obj, depsgraph=depsgraph)
+
+                    if mismatch:
+                        mod = garment_obj.modifiers.get(CG_MOD_SHAPE_PRESERVE)
+                        is_bound = bool(getattr(mod, "is_bind", False)) if mod is not None else False
+                        if mod is None or not is_bound:
+                            missing_rest += 1
+                            self.report(
+                                {"WARNING"},
+                                f"{garment_obj.name}: Rest Shape is missing for visual modifier mode. "
+                                "Go to a clean frame and click Store Rest Shape.",
+                            )
+                            continue
+                        if hasattr(mod, "factor"):
+                            mod.factor = float(settings.shape_strength)
+                        done += 1
+                        self.report({"INFO"}, f"{garment_obj.name}: preserve active (visual modifier mode)")
+                        continue
+
                     keys = garment_obj.data.shape_keys
                     if keys is None or keys.key_blocks.get(CG_SHAPEKEY_REST) is None:
                         missing_rest += 1
                         self.report({"WARNING"}, f"{garment_obj.name}: Rest Shape is missing. Click Store Rest Shape on a clean frame.")
                         continue
 
-                    mismatch = _topology_mismatch(garment_obj=garment_obj, depsgraph=depsgraph)
-                    mods = _likely_topology_modifiers(garment_obj) if mismatch else []
-                    with _temporarily_disable_modifiers(garment_obj, mods):
-                        if mods:
-                            context.view_layer.update()
-                            depsgraph = context.evaluated_depsgraph_get()
-                        ensure_live_preserve_shapekey(garment_obj)
-                        changed, max_d = generate_shape_preservation(
-                            garment_obj=garment_obj,
-                            depsgraph=depsgraph,
-                            strength=settings.shape_strength,
-                            smoothing_iterations=settings.wrinkle_smoothing_iterations,
-                            smoothing_strength=settings.wrinkle_smoothing_strength,
-                            volume_preservation=settings.volume_preservation,
-                            silhouette_preservation=settings.silhouette_preservation,
-                            drift_threshold=settings.drift_threshold,
-                            protect_borders=settings.protect_borders,
-                            protect_groups=settings.protect_preserve_groups,
-                        )
+                    ensure_live_preserve_shapekey(garment_obj)
+                    changed, max_d = generate_shape_preservation(
+                        garment_obj=garment_obj,
+                        depsgraph=depsgraph,
+                        strength=settings.shape_strength,
+                        smoothing_iterations=settings.wrinkle_smoothing_iterations,
+                        smoothing_strength=settings.wrinkle_smoothing_strength,
+                        volume_preservation=settings.volume_preservation,
+                        silhouette_preservation=settings.silhouette_preservation,
+                        drift_threshold=settings.drift_threshold,
+                        protect_borders=settings.protect_borders,
+                        protect_groups=settings.protect_preserve_groups,
+                    )
                     if changed <= 0:
                         zero_delta += 1
                         self.report(
@@ -930,31 +980,54 @@ class CG_OT_generate_shape_preservation_flagged(Operator):
                     for garment_obj in garments:
                         try:
                             mismatch = _topology_mismatch(garment_obj=garment_obj, depsgraph=depsgraph)
-                            mods = _likely_topology_modifiers(garment_obj) if mismatch else []
-                            with _temporarily_disable_modifiers(garment_obj, mods):
-                                if mods:
-                                    context.view_layer.update()
-                                    depsgraph = context.evaluated_depsgraph_get()
-                                ensure_live_preserve_shapekey(garment_obj)
-                                changed, max_d = generate_shape_preservation(
+                            if mismatch:
+                                mod = garment_obj.modifiers.get(CG_MOD_SHAPE_PRESERVE)
+                                is_bound = bool(getattr(mod, "is_bind", False)) if mod is not None else False
+                                if mod is None or not is_bound:
+                                    self.report(
+                                        {"WARNING"},
+                                        f"{garment_obj.name}: missing visual rest bind. Go to a clean frame and click Store Rest Shape.",
+                                    )
+                                    continue
+                                _keyframe_modifier_factor(
                                     garment_obj=garment_obj,
-                                    depsgraph=depsgraph,
-                                    strength=settings.shape_strength,
-                                    smoothing_iterations=settings.wrinkle_smoothing_iterations,
-                                    smoothing_strength=settings.wrinkle_smoothing_strength,
-                                    volume_preservation=settings.volume_preservation,
-                                    silhouette_preservation=settings.silhouette_preservation,
-                                    drift_threshold=settings.drift_threshold,
-                                    protect_borders=settings.protect_borders,
-                                    protect_groups=settings.protect_preserve_groups,
+                                    mod_name=CG_MOD_SHAPE_PRESERVE,
+                                    frame=frame - 1,
+                                    value=0.0,
                                 )
+                                _keyframe_modifier_factor(
+                                    garment_obj=garment_obj,
+                                    mod_name=CG_MOD_SHAPE_PRESERVE,
+                                    frame=frame,
+                                    value=float(settings.shape_strength),
+                                )
+                                _keyframe_modifier_factor(
+                                    garment_obj=garment_obj,
+                                    mod_name=CG_MOD_SHAPE_PRESERVE,
+                                    frame=frame + 1,
+                                    value=0.0,
+                                )
+                                baked += 1
+                                continue
+
+                            ensure_live_preserve_shapekey(garment_obj)
+                            changed, max_d = generate_shape_preservation(
+                                garment_obj=garment_obj,
+                                depsgraph=depsgraph,
+                                strength=settings.shape_strength,
+                                smoothing_iterations=settings.wrinkle_smoothing_iterations,
+                                smoothing_strength=settings.wrinkle_smoothing_strength,
+                                volume_preservation=settings.volume_preservation,
+                                silhouette_preservation=settings.silhouette_preservation,
+                                drift_threshold=settings.drift_threshold,
+                                protect_borders=settings.protect_borders,
+                                protect_groups=settings.protect_preserve_groups,
+                            )
                             if changed <= 0:
                                 continue
 
-                            # Bake a per-frame preserve shape key (non-destructive; base topology).
                             view_layer.objects.active = garment_obj
                             key_name = f"CG_Preserve_{frame:04d}"
-                            # Bake from mix with preserve live enabled.
                             preserve_kb = garment_obj.data.shape_keys.key_blocks.get(CG_SHAPEKEY_LIVE_PRESERVE)
                             if preserve_kb is not None:
                                 preserve_kb.value = 1.0
@@ -1451,6 +1524,28 @@ def _keyframe_shapekey_value(*, garment_obj: bpy.types.Object, key_name: str, fr
     if ad is None or ad.action is None:
         return
     data_path = f'key_blocks["{kb.name}"].value'
+    fc = ad.action.fcurves.find(data_path=data_path)
+    if fc is None:
+        return
+    for kp in fc.keyframe_points:
+        if int(round(kp.co.x)) == int(frame):
+            kp.interpolation = "CONSTANT"
+
+
+def _keyframe_modifier_factor(*, garment_obj: bpy.types.Object, mod_name: str, frame: int, value: float) -> None:
+    mod = garment_obj.modifiers.get(mod_name)
+    if mod is None or not hasattr(mod, "factor"):
+        return
+    mod.factor = float(value)
+    try:
+        mod.keyframe_insert(data_path="factor", frame=int(frame))
+    except Exception:
+        return
+
+    ad = garment_obj.animation_data
+    if ad is None or ad.action is None:
+        return
+    data_path = f'modifiers["{mod.name}"].factor'
     fc = ad.action.fcurves.find(data_path=data_path)
     if fc is None:
         return

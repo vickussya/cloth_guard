@@ -37,11 +37,13 @@ CG_VG_PRESERVE_SEAMS = "CG_Preserve_Seams"
 CG_MOD_BODY_MASK = "CG_BodyMask"
 CG_MOD_ANTICLIP = "CG_AntiClip"
 CG_MOD_SMOOTH = "CG_Smooth"
+CG_MOD_SHAPE_PRESERVE = "CG_ShapePreserve"
 
 CG_SHAPEKEY_LIVE = "CG_LiveCorrection"
 CG_SHAPEKEY_LIVE_PRESERVE = "CG_LivePreserve"
 CG_SHAPEKEY_REST = "CG_RestShape"
 CG_VG_SHAPE_DRIFT = "CG_ShapeDrift"
+CG_VG_SHAPE_PRESERVE = "CG_ShapePreserve"
 
 
 def is_mesh_object(obj) -> bool:
@@ -1084,6 +1086,79 @@ def ensure_anticlip_modifiers(
     return mod_sw, mod_sm
 
 
+def compute_shape_preserve_mask_weights(
+    garment_obj: bpy.types.Object,
+    *,
+    protect_groups: bool,
+) -> list[float]:
+    """
+    Build a per-vertex mask for shape preservation modifiers.
+
+    This is designed to work even when the garment has topology-changing modifiers
+    (weights will be propagated by modifiers like Subdivision).
+    """
+    base_mesh = garment_obj.data
+    weights = [1.0] * len(base_mesh.vertices)
+
+    if not protect_groups:
+        return weights
+
+    pinned_idx = _vertex_group_index(garment_obj, CG_VG_PINNED)
+    collar_idx = _vertex_group_index(garment_obj, CG_VG_PRESERVE_COLLAR)
+    hem_idx = _vertex_group_index(garment_obj, CG_VG_PRESERVE_HEM)
+    seams_idx = _vertex_group_index(garment_obj, CG_VG_PRESERVE_SEAMS)
+
+    for i, v in enumerate(base_mesh.vertices):
+        scale = 1.0
+        if pinned_idx is not None:
+            pw = _vertex_weight(v, pinned_idx)
+            if pw > 0.0:
+                scale *= max(0.0, 1.0 - pw)
+
+        preserve_w = 0.0
+        if collar_idx is not None:
+            preserve_w = max(preserve_w, _vertex_weight(v, collar_idx))
+        if hem_idx is not None:
+            preserve_w = max(preserve_w, _vertex_weight(v, hem_idx))
+        if seams_idx is not None:
+            preserve_w = max(preserve_w, _vertex_weight(v, seams_idx))
+        if preserve_w > 0.0:
+            # Strongly protect these regions.
+            scale *= max(0.0, 1.0 - preserve_w * 0.9)
+
+        weights[i] *= scale
+
+    return weights
+
+
+def ensure_shape_preserve_modifier(
+    garment_obj: bpy.types.Object,
+    *,
+    iterations: int,
+    factor: float,
+) -> bpy.types.CorrectiveSmoothModifier:
+    """
+    Ensure a Corrective Smooth modifier used for post-stack shape preservation.
+
+    This modifier is topology-safe and works after Subdivision/Geometry Nodes, etc.
+    Bind it on a clean frame (Store Rest Shape) so it uses that as the reference.
+    """
+    mod = garment_obj.modifiers.get(CG_MOD_SHAPE_PRESERVE)
+    if mod is None:
+        mod = garment_obj.modifiers.new(name=CG_MOD_SHAPE_PRESERVE, type="CORRECTIVE_SMOOTH")
+
+    if hasattr(mod, "iterations"):
+        mod.iterations = int(max(0, iterations))
+    if hasattr(mod, "factor"):
+        mod.factor = float(max(0.0, min(1.0, factor)))
+    if hasattr(mod, "use_only_smooth"):
+        mod.use_only_smooth = True
+    if hasattr(mod, "scale"):
+        mod.scale = 1.0
+
+    return mod
+
+
 def cg_update_modifier_visibility(context) -> None:
     scene = getattr(context, "scene", None)
     if scene is None:
@@ -1127,7 +1202,7 @@ def cg_update_modifier_visibility(context) -> None:
                 kb2.value = 1.0 if enabled else 0.0
 
         # Legacy modifier-based workflow (kept for backwards compatibility if present).
-        for mod_name in (CG_MOD_ANTICLIP, CG_MOD_SMOOTH):
+        for mod_name in (CG_MOD_ANTICLIP, CG_MOD_SMOOTH, CG_MOD_SHAPE_PRESERVE):
             mod = garment_obj.modifiers.get(mod_name)
             if mod is None:
                 continue
