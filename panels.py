@@ -29,8 +29,8 @@ class CG_UL_garments(UIList):
         row.prop(item, "enabled", text="")
         if item.object is None:
             row.label(text="<None>", icon="MESH_DATA")
-            else:
-                row.prop(item, "object", text="", emboss=False, icon="MESH_DATA")
+        else:
+            row.prop(item, "object", text="", emboss=False, icon="MESH_DATA")
             # Rest shape status indicator (beginner-friendly).
             has_rest = False
             try:
@@ -47,7 +47,10 @@ class CG_UL_garments(UIList):
                     has_rest = bool(item.object.get("cg_rest_success", 0))
             except Exception:
                 has_rest = False
-            row.label(text=("Rest: Stored" if has_rest else "Rest: Missing"), icon=("CHECKMARK" if has_rest else "ERROR"))
+            row.label(
+                text=("Rest: Stored" if has_rest else "Rest: Missing"),
+                icon=("CHECKMARK" if has_rest else "ERROR"),
+            )
 
 
 class CG_UL_problem_frames(UIList):
