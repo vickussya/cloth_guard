@@ -139,7 +139,3 @@ Cloth Guard is designed to be non-destructive to mesh topology and vertex order:
 ## License
 
 This project is licensed under the **GNU General Public License v3.0 (GPL-3.0)**. See `LICENSE`.
-
-## Author
-
-- **Vickussya**
