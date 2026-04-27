@@ -337,35 +337,77 @@ def _run_shape_key_passes(
     smooth_it = int(settings.smooth_iterations) if mode == "SMART" else 0
     smooth_st = float(settings.smooth_strength) if mode == "SMART" else 0.0
 
+    def _is_worse(before_det, after_det) -> bool:
+        b_c = int(before_det.stats.flagged_clipping)
+        a_c = int(after_det.stats.flagged_clipping)
+        if a_c > b_c:
+            return True
+        b_p = before_det.stats.max_penetration
+        a_p = after_det.stats.max_penetration
+        if b_p is not None and a_p is not None and a_p > b_p + 1e-8:
+            return True
+        return False
+
+    def _snapshot_keyblock(kb) -> list:
+        return [p.co.copy() for p in kb.data]
+
+    def _restore_keyblock(kb, snap: list) -> None:
+        if len(kb.data) != len(snap):
+            return
+        for i in range(len(snap)):
+            kb.data[i].co = snap[i]
+
+    live_kb = ensure_live_correction_shapekey(garment_obj)
+    # Track best accepted detection so we never keep a worse result.
+    det_best = det_before
+
     for p in range(passes):
-        stats = correct_current_pose(
-            garment_obj=garment_obj,
-            body_obj=body_obj,
-            depsgraph=depsgraph,
-            offset_distance=target_offset,
-            detection_radius=max(target_offset, settings.detection_radius),
-            correction_strength=strength,
-            max_push_distance=settings.max_push_distance,
-            smooth_iterations=smooth_it,
-            smooth_strength=smooth_st,
-            use_risk_area=settings.use_risk_area,
-            preserve_pinned_areas=settings.preserve_pinned_areas,
-            accumulate=(p > 0),
-        )
+        # Verification-based correction: never keep a correction that makes clipping worse.
+        attempt_strength = float(strength)
+        accepted = False
+        det_after = det_best
+        stats = None
 
-        # Re-evaluate to let the depsgraph see the updated shapekey.
-        context.view_layer.update()
-        depsgraph = context.evaluated_depsgraph_get()
+        snap = _snapshot_keyblock(live_kb)
+        for attempt in range(4):
+            stats = correct_current_pose(
+                garment_obj=garment_obj,
+                body_obj=body_obj,
+                depsgraph=depsgraph,
+                offset_distance=target_offset,
+                detection_radius=max(target_offset, settings.detection_radius),
+                correction_strength=attempt_strength,
+                max_push_distance=settings.max_push_distance,
+                smooth_iterations=smooth_it,
+                smooth_strength=smooth_st,
+                use_risk_area=settings.use_risk_area,
+                preserve_pinned_areas=settings.preserve_pinned_areas,
+                accumulate=(p > 0),
+            )
 
-        det_after, _, _ = _run_detection_and_weights(
-            context=context,
-            settings=settings,
-            garment_obj=garment_obj,
-            body_obj=body_obj,
-            depsgraph=depsgraph,
-            offset_distance=target_offset,
-            detection_radius=max(target_offset, settings.detection_radius),
-        )
+            context.view_layer.update()
+            depsgraph = context.evaluated_depsgraph_get()
+
+            det_after, _, _ = _run_detection_and_weights(
+                context=context,
+                settings=settings,
+                garment_obj=garment_obj,
+                body_obj=body_obj,
+                depsgraph=depsgraph,
+                offset_distance=target_offset,
+                detection_radius=max(target_offset, settings.detection_radius),
+            )
+
+            if _is_worse(det_best, det_after):
+                _restore_keyblock(live_kb, snap)
+                context.view_layer.update()
+                depsgraph = context.evaluated_depsgraph_get()
+                attempt_strength *= 0.5
+                continue
+
+            accepted = True
+            det_best = det_after
+            break
 
         print(
             "[Cloth Guard][Pass]",
@@ -373,14 +415,20 @@ def _run_shape_key_passes(
             f"pass={p+1}/{passes}",
             f"before={int(det_before.stats.flagged_clipping)}",
             f"after={int(det_after.stats.flagged_clipping)}",
-            f"changed={stats.changed_verts}",
-            f"max_delta={stats.max_delta_distance:.6f} m",
+            f"accepted={'YES' if accepted else 'NO'}",
+            (f"changed={getattr(stats, 'changed_verts', 0)}" if stats is not None else "changed=0"),
+            (f"max_delta={getattr(stats, 'max_delta_distance', 0.0):.6f} m" if stats is not None else "max_delta=0.000000 m"),
+            (f"pen_before={float(det_before.stats.max_penetration or 0.0):.6f} m" if hasattr(det_before.stats, "max_penetration") else ""),
+            (f"pen_after={float(det_after.stats.max_penetration or 0.0):.6f} m" if hasattr(det_after.stats, "max_penetration") else ""),
         )
 
-        if int(det_after.stats.flagged_clipping) <= 0:
-            return det_before, det_after, p + 1
+        if not accepted:
+            # Rejected: stop early; we refuse to keep a worse correction.
+            return det_before, det_best, p
+        if int(det_best.stats.flagged_clipping) <= 0:
+            return det_before, det_best, p + 1
 
-    return det_before, det_after, passes
+    return det_before, det_best, passes
 
 
 class CG_OT_check_garment_compatibility(Operator):
@@ -515,6 +563,81 @@ def _validate_garments_only(settings):
     if not garments:
         return None
     return garments
+
+
+def _set_anticlip_helper_factor(*, garment_obj: bpy.types.Object, value: float) -> None:
+    mod = garment_obj.modifiers.get(CG_MOD_ANTICLIP)
+    if mod is None:
+        return
+    if getattr(mod, "type", "") == "NODES" and getattr(mod, "node_group", None) is not None:
+        idx = mod.node_group.inputs.find("Factor")
+        if idx >= 0:
+            mod[f"Input_{idx+1}"] = float(value)
+        return
+    if hasattr(mod, "strength"):
+        base = float(mod.get("cg_strength_base", 1.0))
+        mod.strength = float(value) * base
+
+
+def _verify_helper_correction(
+    *,
+    context,
+    settings,
+    garment_obj: bpy.types.Object,
+    body_obj: bpy.types.Object,
+    depsgraph,
+    det_before,
+    target_offset: float,
+) -> tuple[float, object]:
+    """
+    Apply helper correction (GN/Displace) and verify it does not worsen body clipping.
+    Returns (accepted_factor, det_after_best).
+    """
+    factor = 1.0
+    det_best = det_before
+
+    def _is_worse(before_det, after_det) -> bool:
+        if int(after_det.stats.flagged_clipping) > int(before_det.stats.flagged_clipping):
+            return True
+        b_p = getattr(before_det.stats, "max_penetration", None)
+        a_p = getattr(after_det.stats, "max_penetration", None)
+        if b_p is not None and a_p is not None and float(a_p) > float(b_p) + 1e-8:
+            return True
+        return False
+
+    for _ in range(5):
+        _set_anticlip_helper_factor(garment_obj=garment_obj, value=factor)
+        context.view_layer.update()
+        depsgraph = context.evaluated_depsgraph_get()
+        det_after, _, _ = _run_detection_and_weights(
+            context=context,
+            settings=settings,
+            garment_obj=garment_obj,
+            body_obj=body_obj,
+            depsgraph=depsgraph,
+            offset_distance=target_offset,
+            detection_radius=max(target_offset, settings.detection_radius),
+        )
+        if _is_worse(det_best, det_after):
+            factor *= 0.5
+            continue
+        det_best = det_after
+        return float(factor), det_best
+
+    # Reject: disable helper correction.
+    _set_anticlip_helper_factor(garment_obj=garment_obj, value=0.0)
+    context.view_layer.update()
+    depsgraph = context.evaluated_depsgraph_get()
+    det_after, _, _ = _run_detection_and_weights(
+        context=context,
+        settings=settings,
+        garment_obj=garment_obj,
+        body_obj=body_obj,
+        depsgraph=depsgraph,
+        offset_distance=target_offset,
+        detection_radius=max(target_offset, settings.detection_radius),
+    )
+    return 0.0, det_after
 
 
 def _shapekey_delta_stats(*, garment_obj: bpy.types.Object, shapekey_name: str) -> tuple[int, float]:
@@ -1486,16 +1609,6 @@ class CG_OT_correct_current_pose(Operator):
                             strength=max(0.0, min(1.0, float(settings.correction_strength) * float(settings.push_multiplier))),
                             max_push_distance=float(settings.max_push_distance),
                         )
-                        mod = garment_obj.modifiers.get(CG_MOD_ANTICLIP)
-                        if mod is not None:
-                            if getattr(mod, "type", "") == "NODES" and getattr(mod, "node_group", None) is not None:
-                                ng = mod.node_group
-                                idx = ng.inputs.find("Factor")
-                                if idx >= 0:
-                                    mod[f"Input_{idx+1}"] = 1.0
-                            elif hasattr(mod, "strength"):
-                                base = float(mod.get("cg_strength_base", target_offset))
-                                mod.strength = base
                         total_corrected += int(clipping_affected)
                         s = det.stats
                         total_checked += s.checked_verts
@@ -1509,16 +1622,14 @@ class CG_OT_correct_current_pose(Operator):
                             f"{garment_obj.name}: topology-changing modifiers detected; using helper/modifier correction mode. {_NON_DESTRUCTIVE_MSG}",
                         )
                         # Residual check (still in cage mode so mapping stays stable).
-                        context.view_layer.update()
-                        depsgraph = context.evaluated_depsgraph_get()
-                        det_after, _, _ = _run_detection_and_weights(
+                        accepted_factor, det_after = _verify_helper_correction(
                             context=context,
                             settings=settings,
                             garment_obj=garment_obj,
                             body_obj=body_obj,
                             depsgraph=depsgraph,
-                            offset_distance=target_offset,
-                            detection_radius=max(target_offset, settings.detection_radius),
+                            det_before=det,
+                            target_offset=target_offset,
                         )
                         after_clipping = int(det_after.stats.flagged_clipping)
                         max_w = 0.0
@@ -1533,12 +1644,13 @@ class CG_OT_correct_current_pose(Operator):
                             base = float(target_offset)
                         approx_max_delta = base * max_w
                         protect_txt = "ON" if bool(settings.preserve_pinned_areas) else "OFF"
+                        accept_txt = "ACCEPTED" if accepted_factor > 0.0 else "REJECTED"
                         self.report(
                             {"INFO"},
                             f"{garment_obj.name}: {before_clipping} clipping before, {after_clipping} remaining (helper mode); "
                             f"max_push≈{approx_max_delta:.6f} m; mode={str(getattr(settings, 'anticlip_mode', 'SAFE_PUSHOUT'))}; "
                             f"smoothing={'ON' if str(getattr(settings, 'anticlip_mode', 'SAFE_PUSHOUT'))=='SMART' else 'OFF'}; "
-                            f"shrink_protect={protect_txt}",
+                            f"shrink_protect={protect_txt}; verify={accept_txt}",
                         )
                     except Exception as e:
                         self.report({"ERROR"}, f"{garment_obj.name}: helper/modifier correction failed: {e}")
@@ -1874,8 +1986,17 @@ class CG_OT_generate_correction_current_frame(Operator):
                             strength=max(0.0, min(1.0, float(settings.correction_strength) * float(settings.push_multiplier))),
                             max_push_distance=float(settings.max_push_distance),
                         )
+                        accepted_factor, det_after = _verify_helper_correction(
+                            context=context,
+                            settings=settings,
+                            garment_obj=garment_obj,
+                            body_obj=body_obj,
+                            depsgraph=depsgraph,
+                            det_before=det,
+                            target_offset=target_offset,
+                        )
                         _keyframe_modifier_strength(garment_obj=garment_obj, mod_name=CG_MOD_ANTICLIP, frame=frame - 1, value=0.0)
-                        _keyframe_modifier_strength(garment_obj=garment_obj, mod_name=CG_MOD_ANTICLIP, frame=frame, value=1.0)
+                        _keyframe_modifier_strength(garment_obj=garment_obj, mod_name=CG_MOD_ANTICLIP, frame=frame, value=float(accepted_factor))
                         _keyframe_modifier_strength(garment_obj=garment_obj, mod_name=CG_MOD_ANTICLIP, frame=frame + 1, value=0.0)
                         baked += 1
                         print(
@@ -1883,6 +2004,8 @@ class CG_OT_generate_correction_current_frame(Operator):
                             garment_obj.name,
                             f"frame={frame}",
                             f"clipping={int(det.stats.flagged_clipping)}",
+                            f"after={int(det_after.stats.flagged_clipping)}",
+                            f"accepted_factor={accepted_factor:.3f}",
                             f"clipping_vg={clipping_affected}",
                             f"mod={CG_MOD_ANTICLIP}",
                         )
@@ -1984,8 +2107,17 @@ class CG_OT_generate_corrections_flagged_frames(Operator):
                                     strength=max(0.0, min(1.0, float(settings.correction_strength) * float(settings.push_multiplier))),
                                     max_push_distance=float(settings.max_push_distance),
                                 )
+                                accepted_factor, det_after = _verify_helper_correction(
+                                    context=context,
+                                    settings=settings,
+                                    garment_obj=garment_obj,
+                                    body_obj=body_obj,
+                                    depsgraph=depsgraph,
+                                    det_before=det,
+                                    target_offset=target_offset,
+                                )
                                 _keyframe_modifier_strength(garment_obj=garment_obj, mod_name=CG_MOD_ANTICLIP, frame=frame - 1, value=0.0)
-                                _keyframe_modifier_strength(garment_obj=garment_obj, mod_name=CG_MOD_ANTICLIP, frame=frame, value=1.0)
+                                _keyframe_modifier_strength(garment_obj=garment_obj, mod_name=CG_MOD_ANTICLIP, frame=frame, value=float(accepted_factor))
                                 _keyframe_modifier_strength(garment_obj=garment_obj, mod_name=CG_MOD_ANTICLIP, frame=frame + 1, value=0.0)
                                 baked_keys += 1
                                 print(
@@ -1993,6 +2125,8 @@ class CG_OT_generate_corrections_flagged_frames(Operator):
                                     garment_obj.name,
                                     f"frame={frame}",
                                     f"clipping={int(det.stats.flagged_clipping)}",
+                                    f"after={int(det_after.stats.flagged_clipping)}",
+                                    f"accepted_factor={accepted_factor:.3f}",
                                     f"clipping_vg={clipping_affected}",
                                     f"mod={CG_MOD_ANTICLIP}",
                                 )

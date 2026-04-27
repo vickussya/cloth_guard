@@ -106,6 +106,7 @@ class ClipDetectionStats:
     flagged_clipping: int
     min_nearest_distance: float | None
     avg_flagged_distance: float | None
+    max_penetration: float | None
 
 
 @dataclass(frozen=True)
@@ -469,6 +470,15 @@ def detect_clipping(
         flagged_contact = sum(1 for w in contact_weights if w > 0.0)
         flagged_clipping = sum(1 for w in clipping_weights if w > 0.0)
         flagged_dists = [d for i, d in enumerate(nearest_distances) if d is not None and clipping_weights[i] > 0.0]
+        max_pen = None
+        try:
+            for i, d in enumerate(nearest_distances):
+                if d is None or clipping_weights[i] <= 0.0:
+                    continue
+                pen = max(0.0, float(offset_distance) - float(d))
+                max_pen = pen if max_pen is None else max(max_pen, pen)
+        except Exception:
+            max_pen = None
         stats = ClipDetectionStats(
             checked_verts=checked,
             candidates_within_radius=candidates,
@@ -476,6 +486,7 @@ def detect_clipping(
             flagged_clipping=flagged_clipping,
             min_nearest_distance=_safe_min(nearest_distances),
             avg_flagged_distance=_safe_avg(flagged_dists),
+            max_penetration=max_pen,
         )
         return ClipDetectionResult(
             stats=stats,
@@ -639,7 +650,24 @@ def correct_current_pose(
             if scale <= 0.0:
                 continue
 
-            push_dir_world = (body_mw.to_3x3() @ push_dir_body).normalized()
+            # Per-vertex safety: only keep the move if it increases distance from the body.
+            push_dir_body_n = push_dir_body.normalized()
+            delta_body = push_dir_body_n * (push_amount * scale)
+            dist_after = None
+            try:
+                n2 = bvh_body.find_nearest(garment_in_body + delta_body)
+                if n2 is not None and n2[3] is not None:
+                    dist_after = float(n2[3])
+                elif n2 is not None:
+                    dist_after = float((garment_in_body + delta_body - n2[0]).length)
+            except Exception:
+                dist_after = None
+
+            # If distance does not improve, reject this vertex move.
+            if dist_after is not None and dist_after <= dist + 1e-8:
+                continue
+
+            push_dir_world = (body_mw.to_3x3() @ push_dir_body_n).normalized()
             world_delta = push_dir_world * (push_amount * scale)
             local_delta = inv_garment_world.to_3x3() @ world_delta
             deltas[i] = local_delta

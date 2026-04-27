@@ -72,7 +72,7 @@ Steps:
 5. If small intersections remain under the garment, click **Create Body Mask**.
 6. If you need to remove it later, click **Delete Body Mask**.
 
-## Self-Clipping workflow (experimental)
+## Self-Clipping workflow (advanced)
 
 Use this when the garment clips into itself (for example sleeve into torso, collar into shoulder, coat panels intersecting).
 
@@ -82,7 +82,7 @@ Steps:
 2. Click **Detect Self-Clipping**.
 3. Click **Select** to inspect the detected vertices.
 
-Tip: self-clipping detection is experimental and can produce false positives on complex meshes.
+Self-clipping cleanup is an advanced feature. It uses the stored rest shape to help detect when parts of the same garment collapse into each other. Complex meshes may still need review, but the tool is designed to reduce garment self-intersections without changing the original mesh.
 
 ## Combined workflow (recommended order)
 
