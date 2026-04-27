@@ -134,6 +134,56 @@ def _compatibility_report_line(
     return f"{garment_obj.name}: base={base_count} eval={eval_count} => {status}; mods: {mod_txt}"
 
 
+def _is_modifier_bound(mod) -> bool:
+    if mod is None:
+        return False
+    if bool(getattr(mod, "is_bind", False)):
+        return True
+    if bool(getattr(mod, "is_bound", False)):
+        return True
+    rs = getattr(mod, "rest_source", None)
+    # If rest_source is set to BIND, treat it as likely bound.
+    return bool(rs == "BIND")
+
+
+def _set_rest_status_props(
+    garment_obj: bpy.types.Object,
+    *,
+    mode: str,
+    base_count: int,
+    eval_count: int,
+    success: bool,
+) -> None:
+    """
+    Persist rest-shape storage status on the object so it survives save/load and UI refresh.
+    """
+    try:
+        garment_obj["cg_rest_mode"] = str(mode)
+        garment_obj["cg_rest_base_verts"] = int(base_count)
+        garment_obj["cg_rest_eval_verts"] = int(eval_count)
+        garment_obj["cg_rest_success"] = int(1 if success else 0)
+    except Exception:
+        pass
+
+
+def _bind_corrective_smooth(context, *, obj: bpy.types.Object, modifier_name: str) -> bool:
+    """
+    Bind a Corrective Smooth modifier using a reliable override so it actually persists.
+    """
+    try:
+        with context.temp_override(
+            object=obj,
+            active_object=obj,
+            selected_objects=[obj],
+            selected_editable_objects=[obj],
+        ):
+            res = bpy.ops.object.correctivesmooth_bind(modifier=modifier_name)
+        return bool("FINISHED" in res)
+    except Exception as e:
+        print("[Cloth Guard][RestBind] bind failed:", obj.name, modifier_name, e)
+        return False
+
+
 def _get_or_create_anticlip_mod(garment_obj: bpy.types.Object) -> bpy.types.Modifier | None:
     mod = garment_obj.modifiers.get(CG_MOD_ANTICLIP)
     if mod is None:
@@ -751,10 +801,22 @@ class CG_OT_store_rest_shape(Operator):
             stored = 0
             for garment_obj in garments:
                 try:
-                    mismatch = _topology_mismatch(garment_obj=garment_obj, depsgraph=depsgraph)
+                    base_count = _base_vertex_count(garment_obj)
+                    eval_count = _eval_vertex_count(garment_obj, depsgraph)
+                    topo_mods = _likely_topology_modifiers(garment_obj)
+                    mismatch = base_count != eval_count
+
+                    print(
+                        "[Cloth Guard][Rest][Debug]",
+                        garment_obj.name,
+                        f"base={base_count}",
+                        f"eval={eval_count}",
+                        f"topo_mods={len(topo_mods)}",
+                    )
 
                     if mismatch:
                         # Topology-changing stack: store the VISUAL reference by binding a post-stack Corrective Smooth.
+                        mode = "EvaluatedMode"
                         weights = compute_shape_preserve_mask_weights(
                             garment_obj,
                             protect_groups=bool(settings.protect_preserve_groups),
@@ -770,35 +832,53 @@ class CG_OT_store_rest_shape(Operator):
                             mod.vertex_group = CG_VG_SHAPE_PRESERVE
 
                         # Bind uses the current evaluated visual shape (including Subdivision/Geo Nodes).
-                        view_layer = context.view_layer
-                        prev_active = view_layer.objects.active
-                        prev_sel = garment_obj.select_get()
-                        view_layer.objects.active = garment_obj
-                        try:
-                            garment_obj.select_set(True)
-                            if hasattr(bpy.ops.object, "correctivesmooth_bind"):
-                                bpy.ops.object.correctivesmooth_bind(modifier=mod.name)
-                            elif hasattr(mod, "is_bind"):
-                                mod.is_bind = True
-                        finally:
-                            try:
-                                garment_obj.select_set(prev_sel)
-                            except Exception:
-                                pass
-                            view_layer.objects.active = prev_active
+                        ok = _bind_corrective_smooth(context, obj=garment_obj, modifier_name=mod.name)
+                        ok = ok or _is_modifier_bound(mod)
+
+                        _set_rest_status_props(
+                            garment_obj,
+                            mode=mode,
+                            base_count=base_count,
+                            eval_count=eval_count,
+                            success=ok,
+                        )
+
+                        if not ok:
+                            self.report(
+                                {"ERROR"},
+                                f"{garment_obj.name}: failed to store evaluated rest shape (modifier bind). "
+                                "Make sure the garment is selectable and try again. See console for details.",
+                            )
+                            print("[Cloth Guard][RestBind] FAILED", garment_obj.name, "modifier", mod.name)
+                            continue
 
                         stored += 1
-                        self.report({"INFO"}, f"Stored rest shape for {garment_obj.name}: visual bind (post-modifiers)")
-                        print("[Cloth Guard][RestBind]", garment_obj.name, "modifier", mod.name)
+                        self.report({"INFO"}, f"Stored evaluated rest shape for {garment_obj.name} ({eval_count} verts) using {mode}.")
+                        print("[Cloth Guard][RestBind] OK", garment_obj.name, "modifier", mod.name)
                         continue
 
                     # Topology-stable: store an exact per-vertex rest shape key.
+                    mode = "ShapeKeyMode"
                     ensure_rest_shape_shapekey(garment_obj)
                     written = store_rest_shape(garment_obj=garment_obj, depsgraph=depsgraph)
+                    _set_rest_status_props(
+                        garment_obj,
+                        mode=mode,
+                        base_count=base_count,
+                        eval_count=eval_count,
+                        success=True,
+                    )
                     stored += 1
-                    self.report({"INFO"}, f"Stored rest shape for {garment_obj.name}: {written} vertices")
-                    print("[Cloth Guard][Rest]", garment_obj.name, f"written={written}")
+                    self.report({"INFO"}, f"Stored rest shape for {garment_obj.name}: {written} vertices using {mode}.")
+                    print("[Cloth Guard][Rest] OK", garment_obj.name, f"written={written}", mode)
                 except Exception as e:
+                    _set_rest_status_props(
+                        garment_obj,
+                        mode="ERROR",
+                        base_count=_base_vertex_count(garment_obj),
+                        eval_count=0,
+                        success=False,
+                    )
                     self.report({"WARNING"}, f"{garment_obj.name}: failed to store rest shape: {e}")
 
             self.report({"INFO"}, f"Stored rest shape for {stored} garment(s) (non-destructive)")

@@ -1153,6 +1153,11 @@ def ensure_shape_preserve_modifier(
         mod.factor = float(max(0.0, min(1.0, factor)))
     if hasattr(mod, "use_only_smooth"):
         mod.use_only_smooth = True
+    if hasattr(mod, "rest_source"):
+        try:
+            mod.rest_source = "BIND"
+        except Exception:
+            pass
     if hasattr(mod, "scale"):
         mod.scale = 1.0
 
