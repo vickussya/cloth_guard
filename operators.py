@@ -29,6 +29,7 @@ from .utils import (
     CG_VG_BODY_MASK,
     CG_VG_CONTACT,
     CG_VG_CLIPPING,
+    CG_VG_SELF_CLIPPING,
     CG_SHAPEKEY_LIVE,
     CG_VG_SHAPE_DRIFT,
     CG_VG_SHAPE_PRESERVE,
@@ -39,6 +40,7 @@ from .utils import (
     clear_vertex_group,
     correct_current_pose,
     detect_clipping,
+    detect_self_clipping,
     ensure_anticlip_modifiers,
     ensure_body_mask_modifier,
     ensure_live_correction_shapekey,
@@ -195,7 +197,13 @@ def _keyframe_modifier_strength(*, garment_obj: bpy.types.Object, mod_name: str,
     mod = garment_obj.modifiers.get(mod_name)
     if mod is None or not hasattr(mod, "strength"):
         return
-    mod.strength = float(value)
+    base = 1.0
+    try:
+        base = float(mod.get("cg_strength_base", 1.0))
+    except Exception:
+        base = 1.0
+    # For add-on owned modifiers we treat the keyframed "value" as a factor (0..1).
+    mod.strength = float(value) * float(base)
     try:
         mod.keyframe_insert(data_path="strength", frame=int(frame))
     except Exception:
@@ -298,6 +306,10 @@ def _run_shape_key_passes(
     strength = float(settings.correction_strength) * float(settings.push_multiplier)
     strength = max(0.0, min(1.0, strength))
 
+    mode = str(getattr(settings, "anticlip_mode", "SAFE_PUSHOUT"))
+    smooth_it = int(settings.smooth_iterations) if mode == "SMART" else 0
+    smooth_st = float(settings.smooth_strength) if mode == "SMART" else 0.0
+
     for p in range(passes):
         stats = correct_current_pose(
             garment_obj=garment_obj,
@@ -307,8 +319,8 @@ def _run_shape_key_passes(
             detection_radius=max(target_offset, settings.detection_radius),
             correction_strength=strength,
             max_push_distance=settings.max_push_distance,
-            smooth_iterations=settings.smooth_iterations,
-            smooth_strength=settings.smooth_strength,
+            smooth_iterations=smooth_it,
+            smooth_strength=smooth_st,
             use_risk_area=settings.use_risk_area,
             preserve_pinned_areas=settings.preserve_pinned_areas,
             accumulate=(p > 0),
@@ -465,6 +477,17 @@ def _validate_assigned_meshes(settings):
     if not garments:
         return None
     return body_obj, garments
+
+
+def _validate_garments_only(settings):
+    garments = _garments_from_list(settings)
+    if not garments:
+        garments = _iter_garment_meshes_from_collection(getattr(settings, "garment_collection", None))
+    if not garments and getattr(settings, "garment_object", None) is not None and is_mesh_object(settings.garment_object):
+        garments = [settings.garment_object]
+    if not garments:
+        return None
+    return garments
 
 
 def _shapekey_delta_stats(*, garment_obj: bpy.types.Object, shapekey_name: str) -> tuple[int, float]:
@@ -1260,6 +1283,119 @@ class CG_OT_select_clipping_vertices(Operator):
         return {"FINISHED"}
 
 
+class CG_OT_detect_self_clipping(Operator):
+    bl_idname = "cloth_guard.detect_self_clipping"
+    bl_label = "Detect Self-Clipping"
+    bl_description = "Experimental: finds garment vertices likely intersecting other parts of the same garment"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        settings = _settings(context)
+        garments = _validate_garments_only(settings)
+        if not garments:
+            self.report({"ERROR"}, "Add one or more garment mesh objects to the Garments list first")
+            return {"CANCELLED"}
+
+        with _temporary_mode_object(context):
+            depsgraph = context.evaluated_depsgraph_get()
+
+            total_checked = 0
+            total_flagged = 0
+            global_min = None
+
+            for garment_obj in garments:
+                # Use cage mode when topology changes, so weights can be written to the base mesh.
+                mismatch = _topology_mismatch(garment_obj=garment_obj, depsgraph=depsgraph)
+                mods = _likely_topology_modifiers(garment_obj) if (mismatch or settings.ignore_topology_modifiers) else []
+
+                try:
+                    with _temporarily_disable_modifiers(garment_obj, mods):
+                        if mods:
+                            context.view_layer.update()
+                            depsgraph = context.evaluated_depsgraph_get()
+                        stats, weights = detect_self_clipping(
+                            garment_obj=garment_obj,
+                            depsgraph=depsgraph,
+                            radius=float(settings.selfclip_radius),
+                            ignore_neighbor_rings=int(settings.selfclip_ignore_rings),
+                        )
+                    affected = write_weights_to_vertex_group(garment_obj, CG_VG_SELF_CLIPPING, weights)
+
+                    total_checked += int(stats.checked_verts)
+                    total_flagged += int(affected)
+                    if stats.min_distance is not None:
+                        global_min = stats.min_distance if global_min is None else min(global_min, stats.min_distance)
+
+                    min_txt = f"{stats.min_distance:.6f} m" if stats.min_distance is not None else "n/a"
+                    print(
+                        "[Cloth Guard][SelfClip]",
+                        garment_obj.name,
+                        f"checked={int(stats.checked_verts)}",
+                        f"flagged={int(affected)}",
+                        f"min={min_txt}",
+                        ("cage=ON" if mods else "cage=OFF"),
+                    )
+                except Exception as e:
+                    self.report({"WARNING"}, f"{garment_obj.name}: self-clipping detect failed: {e}")
+
+        global_min_txt = f"{global_min:.6f} m" if global_min is not None else "n/a"
+        self.report(
+            {"INFO"},
+            f"Self-clipping: processed {len(garments)} garment(s); checked {total_checked} verts; flagged {total_flagged}; min distance {global_min_txt}",
+        )
+        return {"FINISHED"}
+
+
+class CG_OT_select_self_clipping_vertices(Operator):
+    bl_idname = "cloth_guard.select_self_clipping_vertices"
+    bl_label = "Select Self-Clipping Vertices"
+    bl_description = "Select vertices flagged in the CG_SelfClipping vertex group (Edit Mode)"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        settings = _settings(context)
+        garments = _validate_garments_only(settings)
+        if not garments:
+            self.report({"ERROR"}, "Add garment mesh objects to the Garments list first")
+            return {"CANCELLED"}
+
+        garment_obj = context.view_layer.objects.active
+        if garment_obj is None or garment_obj.type != "MESH" or garment_obj not in garments:
+            self.report({"ERROR"}, "Make a garment mesh from the Garments list the active object, then run Select")
+            return {"CANCELLED"}
+
+        vg = garment_obj.vertex_groups.get(CG_VG_SELF_CLIPPING)
+        if vg is None:
+            self.report({"ERROR"}, f"Missing vertex group: {CG_VG_SELF_CLIPPING}")
+            return {"CANCELLED"}
+
+        view_layer = context.view_layer
+        prev_active = view_layer.objects.active
+        view_layer.objects.active = garment_obj
+        garment_obj.select_set(True)
+        try:
+            if garment_obj.mode != "EDIT":
+                bpy.ops.object.mode_set(mode="EDIT")
+
+            import bmesh
+
+            bm = bmesh.from_edit_mesh(garment_obj.data)
+            mesh = garment_obj.data
+            group_index = vg.index
+            for v in bm.verts:
+                v.select_set(False)
+                for g in mesh.vertices[v.index].groups:
+                    if g.group == group_index and g.weight > 0.0:
+                        v.select_set(True)
+                        break
+            bmesh.update_edit_mesh(garment_obj.data, loop_triangles=False, destructive=False)
+        finally:
+            view_layer.objects.active = prev_active
+
+        self.report({"INFO"}, f"Selected {CG_VG_SELF_CLIPPING} vertices")
+        return {"FINISHED"}
+
+
 def _update_correction_weights(context, *, report_to: Operator | None = None) -> int:
     return 0
 
@@ -1319,10 +1455,12 @@ class CG_OT_correct_current_pose(Operator):
                             offset_distance=target_offset,
                             smooth_iterations=settings.smooth_iterations,
                             smooth_strength=settings.smooth_strength,
+                            mode=str(getattr(settings, "anticlip_mode", "SAFE_PUSHOUT")),
                         )
                         mod = garment_obj.modifiers.get(CG_MOD_ANTICLIP)
                         if mod is not None and hasattr(mod, "strength"):
-                            mod.strength = 1.0
+                            base = float(mod.get("cg_strength_base", target_offset))
+                            mod.strength = base
                         total_corrected += int(clipping_affected)
                         s = det.stats
                         total_checked += s.checked_verts
@@ -1348,9 +1486,22 @@ class CG_OT_correct_current_pose(Operator):
                             detection_radius=max(target_offset, settings.detection_radius),
                         )
                         after_clipping = int(det_after.stats.flagged_clipping)
+                        max_w = 0.0
+                        try:
+                            max_w = float(max(det.clipping_weights)) if getattr(det, "clipping_weights", None) else 0.0
+                        except Exception:
+                            max_w = 0.0
+                        base = 0.0
+                        try:
+                            base = float(mod.get("cg_strength_base", target_offset)) if mod is not None else float(target_offset)
+                        except Exception:
+                            base = float(target_offset)
+                        approx_max_delta = base * max_w
+                        protect_txt = "ON" if bool(settings.preserve_pinned_areas) else "OFF"
                         self.report(
                             {"INFO"},
-                            f"{garment_obj.name}: {before_clipping} clipping before, {after_clipping} remaining (helper mode)",
+                            f"{garment_obj.name}: {before_clipping} clipping before, {after_clipping} remaining (helper mode); "
+                            f"max_push≈{approx_max_delta:.6f} m; silhouette_protect={protect_txt}",
                         )
                     except Exception as e:
                         self.report({"ERROR"}, f"{garment_obj.name}: helper/modifier correction failed: {e}")
@@ -1365,9 +1516,12 @@ class CG_OT_correct_current_pose(Operator):
                         depsgraph=depsgraph,
                     )
                     after_clipping = int(det_after.stats.flagged_clipping)
+                    changed_live, max_live = _shapekey_delta_stats(garment_obj=garment_obj, shapekey_name=CG_SHAPEKEY_LIVE)
+                    protect_txt = "ON" if bool(settings.preserve_pinned_areas) else "OFF"
                     self.report(
                         {"INFO"},
-                        f"{garment_obj.name}: {before_clipping} clipping before, {after_clipping} remaining after {used} pass(es).",
+                        f"{garment_obj.name}: {before_clipping} clipping before, {after_clipping} remaining after {used} pass(es); "
+                        f"delta_verts={changed_live}; max_delta={max_live:.6f} m; silhouette_protect={protect_txt}",
                     )
                 except Exception as e:
                     self.report({"ERROR"}, f"{garment_obj.name}: correction failed: {e}")
@@ -1677,6 +1831,7 @@ class CG_OT_generate_correction_current_frame(Operator):
                             offset_distance=target_offset,
                             smooth_iterations=settings.smooth_iterations,
                             smooth_strength=settings.smooth_strength,
+                            mode=str(getattr(settings, "anticlip_mode", "SAFE_PUSHOUT")),
                         )
                         _keyframe_modifier_strength(garment_obj=garment_obj, mod_name=CG_MOD_ANTICLIP, frame=frame - 1, value=0.0)
                         _keyframe_modifier_strength(garment_obj=garment_obj, mod_name=CG_MOD_ANTICLIP, frame=frame, value=1.0)
@@ -1784,6 +1939,7 @@ class CG_OT_generate_corrections_flagged_frames(Operator):
                                     offset_distance=target_offset,
                                     smooth_iterations=settings.smooth_iterations,
                                     smooth_strength=settings.smooth_strength,
+                                    mode=str(getattr(settings, "anticlip_mode", "SAFE_PUSHOUT")),
                                 )
                                 _keyframe_modifier_strength(garment_obj=garment_obj, mod_name=CG_MOD_ANTICLIP, frame=frame - 1, value=0.0)
                                 _keyframe_modifier_strength(garment_obj=garment_obj, mod_name=CG_MOD_ANTICLIP, frame=frame, value=1.0)

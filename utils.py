@@ -27,6 +27,7 @@ from mathutils.bvhtree import BVHTree
 CG_VG_BODY_MASK = "CG_BodyMask"
 CG_VG_CONTACT = "CG_Contact"
 CG_VG_CLIPPING = "CG_Clipping"
+CG_VG_SELF_CLIPPING = "CG_SelfClipping"
 
 CG_VG_RISK = "CG_RiskArea"
 CG_VG_PINNED = "CG_Pinned"
@@ -1054,22 +1055,51 @@ def ensure_anticlip_modifiers(
     offset_distance: float,
     smooth_iterations: int,
     smooth_strength: float,
+    mode: str = "SAFE_PUSHOUT",
 ) -> tuple[bpy.types.Modifier, bpy.types.Modifier | None]:
-    mod_sw = garment_obj.modifiers.get(CG_MOD_ANTICLIP)
-    if mod_sw is None:
-        mod_sw = garment_obj.modifiers.new(name=CG_MOD_ANTICLIP, type="SHRINKWRAP")
-    mod_sw.target = body_obj
-    if hasattr(mod_sw, "wrap_method"):
-        mod_sw.wrap_method = "NEAREST_SURFACEPOINT"
-    if hasattr(mod_sw, "offset"):
-        mod_sw.offset = float(offset_distance)
-    if hasattr(mod_sw, "vertex_group"):
-        mod_sw.vertex_group = CG_VG_CLIPPING
-    if hasattr(mod_sw, "use_keep_above_surface"):
-        mod_sw.use_keep_above_surface = True
+    """
+    Ensure non-destructive anti-clip helper modifiers for topology-changing garments.
+
+    Important: this must not shrink/collapse the garment silhouette globally. For that reason,
+    the default mode uses a Displace modifier (push-out on normals) restricted by CG_Clipping.
+    """
+    offset_distance = max(0.0, float(offset_distance))
+
+    mod_ac = garment_obj.modifiers.get(CG_MOD_ANTICLIP)
+    if mod_ac is not None and mod_ac.type != "DISPLACE":
+        # Preserve any existing legacy modifier without deleting user data.
+        try:
+            mod_ac.name = f"{CG_MOD_ANTICLIP}_Legacy"
+            mod_ac.show_viewport = False
+            mod_ac.show_render = False
+        except Exception:
+            pass
+        mod_ac = None
+
+    if mod_ac is None:
+        mod_ac = garment_obj.modifiers.new(name=CG_MOD_ANTICLIP, type="DISPLACE")
+    # Displace settings (push-out only; restricted to the clipping group).
+    if hasattr(mod_ac, "direction"):
+        mod_ac.direction = "NORMAL"
+    if hasattr(mod_ac, "mid_level"):
+        mod_ac.mid_level = 0.0
+    if hasattr(mod_ac, "vertex_group"):
+        mod_ac.vertex_group = CG_VG_CLIPPING
+    if hasattr(mod_ac, "strength"):
+        # Store the "full on" strength so we can keyframe strength as a factor (0..1).
+        mod_ac["cg_strength_base"] = float(offset_distance)
+        # Default to full strength (live mode); bake/keyframes will override.
+        mod_ac.strength = float(offset_distance)
+    # Ensure it runs late in the stack (post-subdivision/geometry nodes).
+    try:
+        idx = int(garment_obj.modifiers.find(mod_ac.name))
+        if idx >= 0:
+            garment_obj.modifiers.move(idx, len(garment_obj.modifiers) - 1)
+    except Exception:
+        pass
 
     mod_sm = garment_obj.modifiers.get(CG_MOD_SMOOTH)
-    if smooth_iterations > 0 and smooth_strength > 0.0:
+    if str(mode) != "SAFE_PUSHOUT" and smooth_iterations > 0 and smooth_strength > 0.0:
         if mod_sm is None:
             mod_sm = garment_obj.modifiers.new(name=CG_MOD_SMOOTH, type="CORRECTIVE_SMOOTH")
         if hasattr(mod_sm, "vertex_group"):
@@ -1078,12 +1108,134 @@ def ensure_anticlip_modifiers(
             mod_sm.factor = float(smooth_strength)
         if hasattr(mod_sm, "iterations"):
             mod_sm.iterations = int(smooth_iterations)
+        # Smooth after the push-out.
+        try:
+            idx_sm = int(garment_obj.modifiers.find(mod_sm.name))
+            if idx_sm >= 0:
+                garment_obj.modifiers.move(idx_sm, len(garment_obj.modifiers) - 1)
+        except Exception:
+            pass
     else:
         if mod_sm is not None:
-            garment_obj.modifiers.remove(mod_sm)
+            # Don't delete user modifiers; CG_Smooth is add-on owned, so safe to remove.
+            try:
+                garment_obj.modifiers.remove(mod_sm)
+            except Exception:
+                try:
+                    mod_sm.show_viewport = False
+                    mod_sm.show_render = False
+                except Exception:
+                    pass
             mod_sm = None
 
-    return mod_sw, mod_sm
+    return mod_ac, mod_sm
+
+
+@dataclass(frozen=True)
+class SelfClipStats:
+    checked_verts: int
+    flagged_verts: int
+    min_distance: float | None
+
+
+def _neighbor_rings(adjacency: list[list[int]], start: int, rings: int) -> set[int]:
+    if rings <= 0:
+        return {start}
+    visited = {start}
+    frontier = {start}
+    for _ in range(int(rings)):
+        nxt = set()
+        for v in frontier:
+            for nb in adjacency[v]:
+                if nb not in visited:
+                    visited.add(nb)
+                    nxt.add(nb)
+        frontier = nxt
+        if not frontier:
+            break
+    return visited
+
+
+def detect_self_clipping(
+    *,
+    garment_obj: bpy.types.Object,
+    depsgraph,
+    radius: float,
+    ignore_neighbor_rings: int = 2,
+) -> tuple[SelfClipStats, list[float]]:
+    """
+    Experimental: detect suspected self-clipping on a topology-stable evaluated mesh.
+
+    Heuristic:
+    - For each vertex, query nearest point on the same mesh BVH at slight offsets along +/- normal.
+    - Ignore hits on faces that include the vertex or its nearby neighbors (ignore rings).
+    - Flag vertices where a non-adjacent surface is within the given radius.
+    """
+    radius = max(0.0, float(radius))
+    obj_eval = garment_obj.evaluated_get(depsgraph)
+    mesh_eval = obj_eval.to_mesh()
+    try:
+        base_mesh = garment_obj.data
+        if len(mesh_eval.vertices) != len(base_mesh.vertices):
+            raise RuntimeError("Self-clipping detection requires a topology-stable cage evaluation")
+
+        mesh_eval.calc_loop_triangles()
+        verts = [v.co.copy() for v in mesh_eval.vertices]
+        tris = [tuple(lt.vertices) for lt in mesh_eval.loop_triangles]
+        bvh = BVHTree.FromPolygons(verts, tris, all_triangles=True, epsilon=0.0)
+
+        adjacency = _build_vertex_adjacency(base_mesh)
+        ignore_sets: list[set[int]] = [
+            _neighbor_rings(adjacency, i, int(ignore_neighbor_rings)) for i in range(len(base_mesh.vertices))
+        ]
+
+        weights = [0.0] * len(base_mesh.vertices)
+        checked = 0
+        flagged = 0
+        min_d = None
+
+        eps = max(1e-6, radius * 0.25)
+
+        for i, v in enumerate(mesh_eval.vertices):
+            checked += 1
+            if radius <= 0.0:
+                continue
+
+            n = v.normal.normalized() if v.normal.length > 1e-12 else Vector((0.0, 0.0, 1.0))
+            ignore = ignore_sets[i]
+
+            hit_any = False
+            best_dist = None
+            for sign in (1.0, -1.0):
+                p = v.co + n * (eps * sign)
+                hit = bvh.find_nearest(p)
+                if hit is None:
+                    continue
+                _, _, face_index, dist = hit
+                if face_index is None:
+                    continue
+                face_index = int(face_index)
+                tri = tris[face_index]
+                if any(int(vi) in ignore for vi in tri):
+                    continue
+                d = float(dist) if dist is not None else float((p - hit[0]).length)
+                if best_dist is None or d < best_dist:
+                    best_dist = d
+                if d <= radius:
+                    hit_any = True
+
+            if best_dist is not None:
+                min_d = best_dist if min_d is None else min(min_d, best_dist)
+            if not hit_any:
+                continue
+
+            weights[i] = 1.0
+            flagged += 1
+
+        stats = SelfClipStats(checked_verts=checked, flagged_verts=flagged, min_distance=min_d)
+        return stats, weights
+    finally:
+        obj_eval.to_mesh_clear()
 
 
 def compute_shape_preserve_mask_weights(

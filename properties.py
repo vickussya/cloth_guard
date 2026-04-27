@@ -253,6 +253,42 @@ class CG_Settings(PropertyGroup):
         subtype="FACTOR",
     )
 
+    anticlip_mode: EnumProperty(
+        name="Anti-Clip Mode",
+        description="Choose how anti-clipping correction is applied (Safe Push-Out is recommended to preserve silhouette)",
+        items=(
+            (
+                "SAFE_PUSHOUT",
+                "Safe Push-Out",
+                "Local push-out on detected areas only. No global smoothing. Designed to preserve garment silhouette",
+            ),
+            (
+                "SMART",
+                "Smart (Legacy)",
+                "May add extra smoothing to corrected areas (can be more aggressive). Use if Safe Push-Out is not enough",
+            ),
+        ),
+        default="SAFE_PUSHOUT",
+    )
+
+    selfclip_radius: FloatProperty(
+        name="Self-Clip Radius",
+        description="Distance threshold used by experimental self-clipping detection (higher can detect more, but may add false positives)",
+        default=0.01,
+        min=0.0,
+        soft_max=0.2,
+        subtype="DISTANCE",
+        unit="LENGTH",
+    )
+
+    selfclip_ignore_rings: IntProperty(
+        name="Ignore Neighbor Rings",
+        description="Ignore self-clipping hits on directly connected/nearby faces (helps avoid flagging normal adjacent surfaces)",
+        default=2,
+        min=0,
+        max=10,
+    )
+
     shape_strength: FloatProperty(
         name="Shape Strength",
         description="Strength of shape preservation corrective (reduces unwanted distortion while keeping pose deformation)",

@@ -174,6 +174,15 @@ class CG_PT_main(Panel):
         box.operator("cloth_guard.clear_live_correction", text="Clear Live Correction")
 
         box = layout.box()
+        box.label(text="Self-Clipping Detection (Experimental)")
+        row = box.row(align=True)
+        row.operator("cloth_guard.detect_self_clipping", text="Detect Self-Clipping")
+        row.operator("cloth_guard.select_self_clipping_vertices", text="Select")
+        col = box.column(align=True)
+        col.prop(settings, "selfclip_radius")
+        col.prop(settings, "selfclip_ignore_rings")
+
+        box = layout.box()
         box.label(text="Body Mask")
         row = box.row(align=True)
         row.operator("cloth_guard.create_body_mask", text="Create Body Mask")
@@ -209,6 +218,7 @@ class CG_PT_main(Panel):
         col.prop(settings, "correction_passes")
         col.prop(settings, "safety_margin")
         col.prop(settings, "push_multiplier")
+        col.prop(settings, "anticlip_mode")
         col.separator()
         col.prop(settings, "smooth_iterations")
         col.prop(settings, "smooth_strength")
