@@ -72,6 +72,8 @@ _TOPOLOGY_MODIFIER_TYPES = {
     "PARTICLE_SYSTEM",
     "TRIANGULATE",
     "WELD",
+    "BEVEL",
+    "EDGE_SPLIT",
 }
 
 
@@ -755,6 +757,7 @@ class CG_OT_store_rest_shape(Operator):
                         ensure_rest_shape_shapekey(garment_obj)
                         written = store_rest_shape(garment_obj=garment_obj, depsgraph=depsgraph)
                     stored += 1
+                    self.report({"INFO"}, f"Stored rest shape for {garment_obj.name}: {written} vertices")
                     print("[Cloth Guard][Rest]", garment_obj.name, f"written={written}")
                 except Exception as e:
                     self.report({"WARNING"}, f"{garment_obj.name}: failed to store rest shape: {e}")
@@ -833,8 +836,17 @@ class CG_OT_generate_shape_preservation_current(Operator):
         with _temporary_mode_object(context):
             depsgraph = context.evaluated_depsgraph_get()
             done = 0
+            missing_rest = 0
+            zero_delta = 0
+            failed = 0
             for garment_obj in garments:
                 try:
+                    keys = garment_obj.data.shape_keys
+                    if keys is None or keys.key_blocks.get(CG_SHAPEKEY_REST) is None:
+                        missing_rest += 1
+                        self.report({"WARNING"}, f"{garment_obj.name}: Rest Shape is missing. Click Store Rest Shape on a clean frame.")
+                        continue
+
                     mismatch = _topology_mismatch(garment_obj=garment_obj, depsgraph=depsgraph)
                     mods = _likely_topology_modifiers(garment_obj) if mismatch else []
                     with _temporarily_disable_modifiers(garment_obj, mods):
@@ -855,16 +867,29 @@ class CG_OT_generate_shape_preservation_current(Operator):
                             protect_groups=settings.protect_preserve_groups,
                         )
                     if changed <= 0:
-                        self.report({"INFO"}, f"{garment_obj.name}: no shape preservation delta generated")
+                        zero_delta += 1
+                        self.report(
+                            {"INFO"},
+                            f"{garment_obj.name}: no shape preservation change generated. "
+                            "Try increasing Shape Strength or Wrinkle Smooth Strength.",
+                        )
                         continue
                     done += 1
                     self.report({"INFO"}, f"{garment_obj.name}: preserve changed {changed} verts; max delta {max_d:.6f} m")
                     print("[Cloth Guard][Preserve]", garment_obj.name, f"changed={changed}", f"max_delta={max_d:.6f}")
                 except Exception as e:
+                    failed += 1
                     self.report({"WARNING"}, f"{garment_obj.name}: shape preservation failed: {e}")
 
             if done == 0:
-                self.report({"ERROR"}, "No preservation corrections generated. Store Rest Shape first.")
+                if missing_rest == len(garments):
+                    self.report({"ERROR"}, "Rest Shape is missing for all garments. Click Store Rest Shape on a clean frame first.")
+                elif missing_rest > 0:
+                    self.report({"ERROR"}, f"Rest Shape is missing for {missing_rest} garment(s). See warnings above.")
+                elif zero_delta > 0 and failed == 0:
+                    self.report({"ERROR"}, "No preservation change was generated. Try stronger Shape Strength / Wrinkle Smooth Strength.")
+                else:
+                    self.report({"ERROR"}, "No preservation corrections generated. Check the console for details.")
                 return {"CANCELLED"}
 
             settings.enable_live_anti_clip = True

@@ -31,6 +31,14 @@ class CG_UL_garments(UIList):
             row.label(text="<None>", icon="MESH_DATA")
         else:
             row.prop(item, "object", text="", emboss=False, icon="MESH_DATA")
+            # Rest shape status indicator (beginner-friendly).
+            has_rest = False
+            try:
+                keys = item.object.data.shape_keys
+                has_rest = keys is not None and keys.key_blocks.get("CG_RestShape") is not None
+            except Exception:
+                has_rest = False
+            row.label(text=("Rest: Stored" if has_rest else "Rest: Missing"), icon=("CHECKMARK" if has_rest else "ERROR"))
 
 
 class CG_UL_problem_frames(UIList):
