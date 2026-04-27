@@ -1056,17 +1056,203 @@ def ensure_anticlip_modifiers(
     smooth_iterations: int,
     smooth_strength: float,
     mode: str = "SAFE_PUSHOUT",
+    strength: float = 1.0,
+    max_push_distance: float = 0.03,
 ) -> tuple[bpy.types.Modifier, bpy.types.Modifier | None]:
     """
     Ensure non-destructive anti-clip helper modifiers for topology-changing garments.
 
     Important: this must not shrink/collapse the garment silhouette globally. For that reason,
-    the default mode uses a Displace modifier (push-out on normals) restricted by CG_Clipping.
+    the default mode uses a Geometry Nodes push-out (nearest-body direction) restricted by CG_Clipping.
     """
     offset_distance = max(0.0, float(offset_distance))
+    strength = max(0.0, min(1.0, float(strength)))
+    max_push_distance = max(0.0, float(max_push_distance))
+
+    def _ensure_anticlip_node_group() -> bpy.types.NodeTree:
+        name = "CG_AntiClipPushOut"
+        ng = bpy.data.node_groups.get(name)
+        if ng is None:
+            ng = bpy.data.node_groups.new(name=name, type="GeometryNodeTree")
+
+        # Ensure Group IO sockets exist (keep stable names for animation/keyframing).
+        def _ensure_in(sock_type: str, sock_name: str):
+            if ng.inputs.find(sock_name) < 0:
+                ng.inputs.new(sock_type, sock_name)
+
+        def _ensure_out(sock_type: str, sock_name: str):
+            if ng.outputs.find(sock_name) < 0:
+                ng.outputs.new(sock_type, sock_name)
+
+        _ensure_in("NodeSocketGeometry", "Geometry")
+        _ensure_in("NodeSocketObject", "Body")
+        _ensure_in("NodeSocketFloat", "Offset")
+        _ensure_in("NodeSocketFloat", "Strength")
+        _ensure_in("NodeSocketFloat", "Max Push")
+        _ensure_in("NodeSocketFloat", "Factor")
+        _ensure_out("NodeSocketGeometry", "Geometry")
+
+        nodes = ng.nodes
+        links = ng.links
+        nodes.clear()
+
+        n_in = nodes.new("NodeGroupInput")
+        n_in.location = (-800, 0)
+        n_out = nodes.new("NodeGroupOutput")
+        n_out.location = (600, 0)
+
+        n_obj = nodes.new("GeometryNodeObjectInfo")
+        n_obj.location = (-600, 200)
+        n_obj.transform_space = "RELATIVE"
+
+        n_prox = nodes.new("GeometryNodeProximity")
+        n_prox.location = (-350, 200)
+        n_prox.target_element = "FACES"
+
+        n_pos = nodes.new("GeometryNodeInputPosition")
+        n_pos.location = (-600, 0)
+
+        n_sub = nodes.new("ShaderNodeVectorMath")
+        n_sub.location = (-150, 50)
+        n_sub.operation = "SUBTRACT"
+
+        n_norm = nodes.new("ShaderNodeVectorMath")
+        n_norm.location = (0, 50)
+        n_norm.operation = "NORMALIZE"
+
+        n_off_minus = nodes.new("ShaderNodeMath")
+        n_off_minus.location = (-150, -150)
+        n_off_minus.operation = "SUBTRACT"
+
+        n_clamp0 = nodes.new("ShaderNodeMath")
+        n_clamp0.location = (0, -150)
+        n_clamp0.operation = "MAXIMUM"
+        n_clamp0.inputs[1].default_value = 0.0
+
+        n_mul_strength = nodes.new("ShaderNodeMath")
+        n_mul_strength.location = (150, -150)
+        n_mul_strength.operation = "MULTIPLY"
+
+        n_mul_factor = nodes.new("ShaderNodeMath")
+        n_mul_factor.location = (300, -150)
+        n_mul_factor.operation = "MULTIPLY"
+
+        n_min_maxpush = nodes.new("ShaderNodeMath")
+        n_min_maxpush.location = (450, -150)
+        n_min_maxpush.operation = "MINIMUM"
+
+        n_mul_mag = nodes.new("ShaderNodeMath")
+        n_mul_mag.location = (600, -150)
+        n_mul_mag.operation = "MULTIPLY"
+
+        n_attr_clip = nodes.new("GeometryNodeInputNamedAttribute")
+        n_attr_clip.location = (-350, -350)
+        n_attr_clip.data_type = "FLOAT"
+        n_attr_clip.inputs["Name"].default_value = CG_VG_CLIPPING
+
+        n_attr_pinned = nodes.new("GeometryNodeInputNamedAttribute")
+        n_attr_pinned.location = (-350, -450)
+        n_attr_pinned.data_type = "FLOAT"
+        n_attr_pinned.inputs["Name"].default_value = CG_VG_PINNED
+
+        n_attr_col = nodes.new("GeometryNodeInputNamedAttribute")
+        n_attr_col.location = (-350, -550)
+        n_attr_col.data_type = "FLOAT"
+        n_attr_col.inputs["Name"].default_value = CG_VG_PRESERVE_COLLAR
+
+        n_attr_hem = nodes.new("GeometryNodeInputNamedAttribute")
+        n_attr_hem.location = (-350, -650)
+        n_attr_hem.data_type = "FLOAT"
+        n_attr_hem.inputs["Name"].default_value = CG_VG_PRESERVE_HEM
+
+        n_attr_seam = nodes.new("GeometryNodeInputNamedAttribute")
+        n_attr_seam.location = (-350, -750)
+        n_attr_seam.data_type = "FLOAT"
+        n_attr_seam.inputs["Name"].default_value = CG_VG_PRESERVE_SEAMS
+
+        n_max_pres1 = nodes.new("ShaderNodeMath")
+        n_max_pres1.location = (-150, -600)
+        n_max_pres1.operation = "MAXIMUM"
+
+        n_max_pres2 = nodes.new("ShaderNodeMath")
+        n_max_pres2.location = (0, -650)
+        n_max_pres2.operation = "MAXIMUM"
+
+        n_one_minus_pin = nodes.new("ShaderNodeMath")
+        n_one_minus_pin.location = (-150, -450)
+        n_one_minus_pin.operation = "SUBTRACT"
+        n_one_minus_pin.inputs[0].default_value = 1.0
+
+        n_pres_scale = nodes.new("ShaderNodeMath")
+        n_pres_scale.location = (150, -650)
+        n_pres_scale.operation = "MULTIPLY"
+        n_pres_scale.inputs[1].default_value = 0.5
+
+        n_one_minus_pres = nodes.new("ShaderNodeMath")
+        n_one_minus_pres.location = (300, -650)
+        n_one_minus_pres.operation = "SUBTRACT"
+        n_one_minus_pres.inputs[0].default_value = 1.0
+
+        n_mul_scale1 = nodes.new("ShaderNodeMath")
+        n_mul_scale1.location = (450, -450)
+        n_mul_scale1.operation = "MULTIPLY"
+
+        n_mul_scale2 = nodes.new("ShaderNodeMath")
+        n_mul_scale2.location = (600, -450)
+        n_mul_scale2.operation = "MULTIPLY"
+
+        n_set = nodes.new("GeometryNodeSetPosition")
+        n_set.location = (400, 50)
+
+        n_scale_vec = nodes.new("ShaderNodeVectorMath")
+        n_scale_vec.location = (250, 50)
+        n_scale_vec.operation = "SCALE"
+
+        # Wiring
+        links.new(n_in.outputs["Body"], n_obj.inputs["Object"])
+        links.new(n_obj.outputs["Geometry"], n_prox.inputs["Target Geometry"])
+        links.new(n_in.outputs["Geometry"], n_prox.inputs["Geometry"])
+        links.new(n_in.outputs["Geometry"], n_set.inputs["Geometry"])
+
+        links.new(n_pos.outputs["Position"], n_sub.inputs[0])
+        links.new(n_prox.outputs["Position"], n_sub.inputs[1])
+        links.new(n_sub.outputs["Vector"], n_norm.inputs[0])
+
+        links.new(n_in.outputs["Offset"], n_off_minus.inputs[0])
+        links.new(n_prox.outputs["Distance"], n_off_minus.inputs[1])
+        links.new(n_off_minus.outputs["Value"], n_clamp0.inputs[0])
+        links.new(n_clamp0.outputs["Value"], n_mul_strength.inputs[0])
+        links.new(n_in.outputs["Strength"], n_mul_strength.inputs[1])
+        links.new(n_mul_strength.outputs["Value"], n_mul_factor.inputs[0])
+        links.new(n_in.outputs["Factor"], n_mul_factor.inputs[1])
+        links.new(n_mul_factor.outputs["Value"], n_min_maxpush.inputs[0])
+        links.new(n_in.outputs["Max Push"], n_min_maxpush.inputs[1])
+
+        links.new(n_attr_col.outputs["Attribute"], n_max_pres1.inputs[0])
+        links.new(n_attr_hem.outputs["Attribute"], n_max_pres1.inputs[1])
+        links.new(n_max_pres1.outputs["Value"], n_max_pres2.inputs[0])
+        links.new(n_attr_seam.outputs["Attribute"], n_max_pres2.inputs[1])
+        links.new(n_max_pres2.outputs["Value"], n_pres_scale.inputs[0])
+        links.new(n_pres_scale.outputs["Value"], n_one_minus_pres.inputs[1])
+
+        links.new(n_attr_pinned.outputs["Attribute"], n_one_minus_pin.inputs[1])
+        links.new(n_one_minus_pin.outputs["Value"], n_mul_scale1.inputs[0])
+        links.new(n_one_minus_pres.outputs["Value"], n_mul_scale1.inputs[1])
+        links.new(n_mul_scale1.outputs["Value"], n_mul_scale2.inputs[0])
+        links.new(n_attr_clip.outputs["Attribute"], n_mul_scale2.inputs[1])
+
+        # Combine direction with magnitude and scale.
+        links.new(n_norm.outputs["Vector"], n_scale_vec.inputs["Vector"])
+        links.new(n_min_maxpush.outputs["Value"], n_mul_mag.inputs[0])
+        links.new(n_mul_scale2.outputs["Value"], n_mul_mag.inputs[1])
+        links.new(n_mul_mag.outputs["Value"], n_scale_vec.inputs["Scale"])
+        links.new(n_scale_vec.outputs["Vector"], n_set.inputs["Offset"])
+
+        links.new(n_set.outputs["Geometry"], n_out.inputs["Geometry"])
+        return ng
 
     mod_ac = garment_obj.modifiers.get(CG_MOD_ANTICLIP)
-    if mod_ac is not None and mod_ac.type != "DISPLACE":
+    if mod_ac is not None and mod_ac.type not in {"NODES", "DISPLACE"}:
         # Preserve any existing legacy modifier without deleting user data.
         try:
             mod_ac.name = f"{CG_MOD_ANTICLIP}_Legacy"
@@ -1076,27 +1262,49 @@ def ensure_anticlip_modifiers(
             pass
         mod_ac = None
 
-    if mod_ac is None:
-        mod_ac = garment_obj.modifiers.new(name=CG_MOD_ANTICLIP, type="DISPLACE")
-    # Displace settings (push-out only; restricted to the clipping group).
-    if hasattr(mod_ac, "direction"):
-        mod_ac.direction = "NORMAL"
-    if hasattr(mod_ac, "mid_level"):
-        mod_ac.mid_level = 0.0
-    if hasattr(mod_ac, "vertex_group"):
-        mod_ac.vertex_group = CG_VG_CLIPPING
-    if hasattr(mod_ac, "strength"):
-        # Store the "full on" strength so we can keyframe strength as a factor (0..1).
-        mod_ac["cg_strength_base"] = float(offset_distance)
-        # Default to full strength (live mode); bake/keyframes will override.
-        mod_ac.strength = float(offset_distance)
-    # Ensure it runs late in the stack (post-subdivision/geometry nodes).
+    # Prefer Geometry Nodes (push direction based on nearest body point, not garment normals).
     try:
-        idx = int(garment_obj.modifiers.find(mod_ac.name))
-        if idx >= 0:
-            garment_obj.modifiers.move(idx, len(garment_obj.modifiers) - 1)
+        ng = _ensure_anticlip_node_group()
+        if mod_ac is not None and mod_ac.type != "NODES":
+            try:
+                mod_ac.name = f"{CG_MOD_ANTICLIP}_Legacy"
+                mod_ac.show_viewport = False
+                mod_ac.show_render = False
+            except Exception:
+                pass
+            mod_ac = None
+        if mod_ac is None:
+            mod_ac = garment_obj.modifiers.new(name=CG_MOD_ANTICLIP, type="NODES")
+        mod_ac.node_group = ng
+
+        def _set_input(socket_name: str, value):
+            idx = ng.inputs.find(socket_name)
+            if idx < 0:
+                return
+            key = f"Input_{idx+1}"
+            mod_ac[key] = value
+
+        _set_input("Body", body_obj)
+        _set_input("Offset", float(offset_distance))
+        _set_input("Strength", float(strength))
+        _set_input("Max Push", float(max_push_distance if max_push_distance > 0.0 else offset_distance))
+        _set_input("Factor", 1.0)
+        mod_ac["cg_strength_base"] = float(offset_distance)
     except Exception:
-        pass
+        # Fallback: Displace (depends on garment normals; less robust, but topology-safe).
+        if mod_ac is not None and mod_ac.type != "DISPLACE":
+            mod_ac = None
+        if mod_ac is None:
+            mod_ac = garment_obj.modifiers.new(name=CG_MOD_ANTICLIP, type="DISPLACE")
+        if hasattr(mod_ac, "direction"):
+            mod_ac.direction = "NORMAL"
+        if hasattr(mod_ac, "mid_level"):
+            mod_ac.mid_level = 0.0
+        if hasattr(mod_ac, "vertex_group"):
+            mod_ac.vertex_group = CG_VG_CLIPPING
+        if hasattr(mod_ac, "strength"):
+            mod_ac["cg_strength_base"] = float(offset_distance)
+            mod_ac.strength = float(offset_distance)
 
     mod_sm = garment_obj.modifiers.get(CG_MOD_SMOOTH)
     if str(mode) != "SAFE_PUSHOUT" and smooth_iterations > 0 and smooth_strength > 0.0:

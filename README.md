@@ -2,19 +2,19 @@
 
 Post-animation garment cleanup for Blender: preserve stylized clothing shapes and reduce body clipping without cloth simulation.
 
-## What Cloth Guard Does
+## What Cloth Guard does
 
-Cloth Guard is a post-animation cleanup tool for animators and character artists.
+Cloth Guard is a **post-animation cleanup** tool for animators and character artists.
 
-It helps with two common problems:
+It helps you:
 
-1. **Shape Preservation / Stabilization**  
-   Keeps stylized garments looking clean during animation by reducing ugly deformation noise (pinching, collapsing, messy wrinkles).
+- Preserve clean stylized garment shapes during animation playback (stabilization).
+- Scan an animation for clipping frames.
+- Reduce body-through-clothing clipping with non-destructive corrections.
+- Detect self-clipping (garment intersecting itself).
+- Use a body mask as a final fallback for small hidden intersections.
 
-2. **Anti-Clipping / Post-Animation Cleanup**  
-   Reduces body-through-clothing intersections and gives you tools to hide small remaining intersections.
-
-Cloth Guard is not a magic one-click cloth solver. It does not replace proper rigging, weight painting, or cloth simulation in every case.
+Cloth Guard is not a magic one-click cloth solver. It does not replace good rigging, weights, or cloth simulation in every case.
 
 ## Supported Blender version
 
@@ -22,74 +22,77 @@ Cloth Guard is not a magic one-click cloth solver. It does not replace proper ri
 
 ## Installation
 
-1. On GitHub: `Code` -> `Download ZIP`
-2. In Blender: `Edit` -> `Preferences` -> `Add-ons` -> `Install...`
+1. On GitHub: `Code` → `Download ZIP`
+2. In Blender: `Edit` → `Preferences` → `Add-ons` → `Install...`
 3. Select the downloaded ZIP, then enable **Cloth Guard**.
 
-## Recommended Basic Workflow
+## Best recommended workflow (beginner-friendly)
 
-1. **Save a copy** of your Blender file (always keep a backup).
-2. Assign **Body Object**.
-3. Add one or more **Garment Objects** (select garments in the viewport, then click **Add Selected Garment(s)**).
+1. **Save a copy** of your Blender file (keep a backup).
+2. Assign the **Body Object**.
+3. Add your clothing meshes to **Garments** (select them in the viewport, then click **Add Selected Garment**).
 4. Click **Setup Cloth Guard**.
-5. Go to a clean frame where the garment looks correct and click **Store Rest Shape**.
-6. Set **Start Frame** and **End Frame**.
-7. Click **Scan Animation**.
-8. Review the **problem frames** list and jump to them.
-9. Use **Shape Preservation first** if the garment loses its form.
-10. Use **Anti-Clipping** after shape preservation if the body intersects the clothing.
-11. Scrub the timeline and review. If the result is too strong, lower settings and regenerate.
+5. Go to a clean frame where the garment looks correct, then click **Store Rest Shape**.
+6. Use **Shape Preservation** first if the garment loses its form.
+7. Set **Start Frame** and **End Frame**.
+8. Click **Scan Animation**.
+9. Review the **problem frames** list and jump to them.
+10. On a problem frame, run **Detect Clipping**, then **Generate Correction (Current)**.
+11. If needed, run **Detect Self-Clipping** to find garment self-intersections.
+12. If tiny body intersections remain under the garment, run **Create Body Mask**.
+13. Scrub the timeline and review. If the result is too strong, lower settings and regenerate.
 
-## Shape Preservation Workflow (Garment Stabilization)
+## Shape Preservation workflow (stabilization)
 
-Use this when the garment gets ugly wrinkles, collapses, shrinks, or loses its designed silhouette.
+Use this when the garment gets ugly wrinkles, collapses, shrinks, or loses its designed silhouette during the shot.
+
+Steps:
 
 1. Go to a clean frame where the garment looks correct.
 2. Click **Store Rest Shape**.
 3. Go to a problem frame.
 4. Click **Analyze Shape Drift**.
 5. Click **Preserve Shape (Current)**.
-6. Check if the garment keeps its form better.
-7. If it overcorrects, lower **Shape Strength** or **Wrinkle Smooth Strength** and try again.
+6. If it is too strong, lower **Shape Strength** or **Wrinkle Smooth Strength** and try again.
 
 Notes:
 
 - Shape preservation is meant to remove deformation noise. It should not freeze the garment or force it back to a rest pose.
 
-## Anti-Clipping Workflow (Body Intersections)
+## Anti-Clipping workflow (body intersections)
 
 Use this when the body intersects through the clothing.
+
+Steps:
 
 1. Go to a frame with visible clipping.
 2. Click **Detect Clipping**.
 3. Click **Select** to inspect the detected vertices.
 4. Click **Generate Correction (Current)**.
-5. Check if clipping is reduced.
-6. If small body intersections remain under the garment, click **Create Body Mask**.
-7. If you need to remove it, click **Delete Body Mask**.
+5. If small intersections remain under the garment, click **Create Body Mask**.
+6. If you need to remove it later, click **Delete Body Mask**.
 
-## Combined Workflow (Recommended Order)
+## Self-Clipping workflow (experimental)
 
-Combined cleanup workflow:
+Use this when the garment clips into itself (for example sleeve into torso, collar into shoulder, coat panels intersecting).
 
-1. Store Rest Shape on a clean frame.
-2. Scan Animation.
-3. Go to a problem frame.
-4. If the garment shape is distorted, run **Preserve Shape (Current)** first.
-5. Then run **Detect Clipping**.
-6. Use **Select** to check detected clipping areas.
-7. Run **Generate Correction (Current)**.
-8. If tiny body intersections remain under the garment, run **Create Body Mask**.
-9. Scrub the timeline and review the result.
-10. If the result is too strong, lower the settings and regenerate.
+Steps:
 
-Why this order:
+1. Go to a frame where you suspect self-clipping.
+2. Click **Detect Self-Clipping**.
+3. Click **Select** to inspect the detected vertices.
 
-- Shape preservation cleans the garment form first.
-- Anti-clipping fixes remaining body intersections second.
-- Body mask hides small remaining body penetration under the garment as a final fallback.
+Tip: self-clipping detection is experimental and can produce false positives on complex meshes.
 
-## Batch Workflow
+## Combined workflow (recommended order)
+
+Recommended order:
+
+1. **Shape Preservation** (fix garment form first)
+2. **Anti-Clipping** (fix body intersections second)
+3. **Body Mask** (hide small remaining intersections last)
+
+## Batch workflow
 
 Once current-frame results look good, you can batch:
 
@@ -98,20 +101,32 @@ Once current-frame results look good, you can batch:
 
 Tip: test on a short range first (for example **1–30**) before running batch on a full shot.
 
-## Recommended Testing Workflow
+## Button guide (what each button does)
 
-- Duplicate the garment and test on the duplicate first.
-- Hide the original garment.
-- Test on a short frame range.
-- Change only one setting at a time.
+- **Setup Cloth Guard**: prepares needed vertex groups/modifiers and validates your setup.
+- **Store Rest Shape**: stores the clean garment look used as a reference for shape preservation.
+- **Analyze Shape Drift**: checks how much the garment shape has changed from the stored reference.
+- **Preserve Shape (Current)**: creates a non-destructive correction to reduce unwanted deformation on the current frame.
+- **Preserve Shape (All Flagged Frames)**: generates preservation corrections for frames flagged by Scan Animation.
+- **Scan Animation**: scans the selected frame range and lists frames where clipping is detected.
+- **Detect Clipping**: finds garment vertices that are likely intersecting or too close to the body.
+- **Select**: selects detected vertices so you can confirm the detection.
+- **Generate Correction (Current)**: creates a non-destructive anti-clipping correction for the current frame.
+- **Generate Corrections (All Flagged Frames)**: creates non-destructive anti-clipping corrections across flagged frames.
+- **Detect Self-Clipping**: experimental; finds areas where the garment intersects itself.
+- **Select Self-Clipping**: selects the detected self-clipping vertices.
+- **Create Body Mask**: hides body areas under the garment to remove small remaining intersections.
+- **Delete Body Mask**: removes the Cloth Guard body mask and restores hidden body areas.
+- **Clear Live Correction**: resets `CG_LiveCorrection` to match Basis (removes the live anti-clip effect).
 
-## Important Limitations
+## Limitations (important)
 
-- Not a perfect automatic cloth solver.
-- Best results come from clean topology and decent rigging/weights.
-- Extreme poses may still need manual corrective edits.
-- Shape preservation should not freeze the cloth.
+- Not a cloth simulation replacement.
+- Best results come from decent rigging/weights and clean meshes.
+- Extreme poses may still need manual cleanup.
+- Shape preservation should not freeze the garment.
 - Anti-clipping should reduce clipping, not destroy the silhouette.
+- Anti-clipping correction is still being improved; body mask is recommended for small remaining hidden intersections.
 
 ## Non-destructive guarantee
 

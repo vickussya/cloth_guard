@@ -195,14 +195,41 @@ def _get_or_create_anticlip_mod(garment_obj: bpy.types.Object) -> bpy.types.Modi
 
 def _keyframe_modifier_strength(*, garment_obj: bpy.types.Object, mod_name: str, frame: int, value: float) -> None:
     mod = garment_obj.modifiers.get(mod_name)
-    if mod is None or not hasattr(mod, "strength"):
+    if mod is None:
+        return
+
+    # Geometry Nodes: keyframe the "Factor" input (0..1) when available.
+    if getattr(mod, "type", "") == "NODES" and getattr(mod, "node_group", None) is not None:
+        ng = mod.node_group
+        idx = ng.inputs.find("Factor")
+        if idx < 0:
+            return
+        key = f"Input_{idx+1}"
+        mod[key] = float(value)
+        try:
+            mod.keyframe_insert(data_path=f'[\"{key}\"]', frame=int(frame))
+        except Exception:
+            return
+        ad = garment_obj.animation_data
+        if ad is None or ad.action is None:
+            return
+        data_path = f'modifiers[\"{mod.name}\"][\"{key}\"]'
+        fc = ad.action.fcurves.find(data_path=data_path)
+        if fc is None:
+            return
+        for kp in fc.keyframe_points:
+            if int(round(kp.co.x)) == int(frame):
+                kp.interpolation = "CONSTANT"
+        return
+
+    # Displace / others: keyframe strength scaled by base.
+    if not hasattr(mod, "strength"):
         return
     base = 1.0
     try:
         base = float(mod.get("cg_strength_base", 1.0))
     except Exception:
         base = 1.0
-    # For add-on owned modifiers we treat the keyframed "value" as a factor (0..1).
     mod.strength = float(value) * float(base)
     try:
         mod.keyframe_insert(data_path="strength", frame=int(frame))
@@ -1456,11 +1483,19 @@ class CG_OT_correct_current_pose(Operator):
                             smooth_iterations=settings.smooth_iterations,
                             smooth_strength=settings.smooth_strength,
                             mode=str(getattr(settings, "anticlip_mode", "SAFE_PUSHOUT")),
+                            strength=max(0.0, min(1.0, float(settings.correction_strength) * float(settings.push_multiplier))),
+                            max_push_distance=float(settings.max_push_distance),
                         )
                         mod = garment_obj.modifiers.get(CG_MOD_ANTICLIP)
-                        if mod is not None and hasattr(mod, "strength"):
-                            base = float(mod.get("cg_strength_base", target_offset))
-                            mod.strength = base
+                        if mod is not None:
+                            if getattr(mod, "type", "") == "NODES" and getattr(mod, "node_group", None) is not None:
+                                ng = mod.node_group
+                                idx = ng.inputs.find("Factor")
+                                if idx >= 0:
+                                    mod[f"Input_{idx+1}"] = 1.0
+                            elif hasattr(mod, "strength"):
+                                base = float(mod.get("cg_strength_base", target_offset))
+                                mod.strength = base
                         total_corrected += int(clipping_affected)
                         s = det.stats
                         total_checked += s.checked_verts
@@ -1501,7 +1536,9 @@ class CG_OT_correct_current_pose(Operator):
                         self.report(
                             {"INFO"},
                             f"{garment_obj.name}: {before_clipping} clipping before, {after_clipping} remaining (helper mode); "
-                            f"max_push≈{approx_max_delta:.6f} m; silhouette_protect={protect_txt}",
+                            f"max_push≈{approx_max_delta:.6f} m; mode={str(getattr(settings, 'anticlip_mode', 'SAFE_PUSHOUT'))}; "
+                            f"smoothing={'ON' if str(getattr(settings, 'anticlip_mode', 'SAFE_PUSHOUT'))=='SMART' else 'OFF'}; "
+                            f"shrink_protect={protect_txt}",
                         )
                     except Exception as e:
                         self.report({"ERROR"}, f"{garment_obj.name}: helper/modifier correction failed: {e}")
@@ -1521,7 +1558,9 @@ class CG_OT_correct_current_pose(Operator):
                     self.report(
                         {"INFO"},
                         f"{garment_obj.name}: {before_clipping} clipping before, {after_clipping} remaining after {used} pass(es); "
-                        f"delta_verts={changed_live}; max_delta={max_live:.6f} m; silhouette_protect={protect_txt}",
+                        f"delta_verts={changed_live}; max_delta={max_live:.6f} m; mode={str(getattr(settings, 'anticlip_mode', 'SAFE_PUSHOUT'))}; "
+                        f"smoothing={'ON' if str(getattr(settings, 'anticlip_mode', 'SAFE_PUSHOUT'))=='SMART' else 'OFF'}; "
+                        f"shrink_protect={protect_txt}",
                     )
                 except Exception as e:
                     self.report({"ERROR"}, f"{garment_obj.name}: correction failed: {e}")
@@ -1832,6 +1871,8 @@ class CG_OT_generate_correction_current_frame(Operator):
                             smooth_iterations=settings.smooth_iterations,
                             smooth_strength=settings.smooth_strength,
                             mode=str(getattr(settings, "anticlip_mode", "SAFE_PUSHOUT")),
+                            strength=max(0.0, min(1.0, float(settings.correction_strength) * float(settings.push_multiplier))),
+                            max_push_distance=float(settings.max_push_distance),
                         )
                         _keyframe_modifier_strength(garment_obj=garment_obj, mod_name=CG_MOD_ANTICLIP, frame=frame - 1, value=0.0)
                         _keyframe_modifier_strength(garment_obj=garment_obj, mod_name=CG_MOD_ANTICLIP, frame=frame, value=1.0)
@@ -1940,6 +1981,8 @@ class CG_OT_generate_corrections_flagged_frames(Operator):
                                     smooth_iterations=settings.smooth_iterations,
                                     smooth_strength=settings.smooth_strength,
                                     mode=str(getattr(settings, "anticlip_mode", "SAFE_PUSHOUT")),
+                                    strength=max(0.0, min(1.0, float(settings.correction_strength) * float(settings.push_multiplier))),
+                                    max_push_distance=float(settings.max_push_distance),
                                 )
                                 _keyframe_modifier_strength(garment_obj=garment_obj, mod_name=CG_MOD_ANTICLIP, frame=frame - 1, value=0.0)
                                 _keyframe_modifier_strength(garment_obj=garment_obj, mod_name=CG_MOD_ANTICLIP, frame=frame, value=1.0)
