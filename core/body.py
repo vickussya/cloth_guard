@@ -25,10 +25,6 @@ from mathutils import Matrix, Vector
 from mathutils.bvhtree import BVHTree
 
 
-def build_bvh(obj_eval: bpy.types.Object, depsgraph) -> BVHTree:
-    return BVHTree.FromObject(obj_eval, depsgraph, epsilon=0.0)
-
-
 @dataclass(frozen=True)
 class BodySurface:
     """

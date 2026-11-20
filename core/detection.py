@@ -14,7 +14,7 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Clipping detection (body vs garment), self-clipping detection and proximity weights."""
+"""Clipping detection (body vs garment) and self-clipping detection."""
 
 from __future__ import annotations
 
@@ -27,12 +27,10 @@ from mathutils.bvhtree import BVHTree
 from ..constants import (
     BOUNDARY_CLIPPING_SCALE,
     BOUNDARY_CONTACT_SCALE,
-    CG_VG_PINNED,
     CG_VG_PRESERVE_COLLAR,
     CG_VG_PRESERVE_HEM,
     CG_VG_PRESERVE_SEAMS,
     CG_VG_RISK,
-    CORRECTION_PRESERVE_SCALE,
     DETECT_DEBUG_SAMPLES,
     DETECT_PRESERVE_CLIPPING_SCALE,
     DETECT_PRESERVE_CONTACT_SCALE,
@@ -41,7 +39,7 @@ from ..constants import (
     PENETRATION_EPS_FRACTION,
     SELF_CLIP_PROBE_FRACTION,
 )
-from .body import BodySurface, build_body_surface, build_bvh
+from .body import BodySurface, build_body_surface
 from .debug import log_debug
 from .mesh_utils import (
     _boundary_vertex_mask,
@@ -52,12 +50,6 @@ from .mesh_utils import (
     _vertex_group_index,
     _vertex_weight,
 )
-
-
-@dataclass(frozen=True)
-class ProximityWeightsResult:
-    weights: list[float]
-    affected_count: int
 
 
 @dataclass(frozen=True)
@@ -315,109 +307,6 @@ def detect_clipping(
         )
     finally:
         garment_eval.to_mesh_clear()
-
-
-def compute_proximity_weights(
-    *,
-    garment_obj: bpy.types.Object,
-    body_obj: bpy.types.Object,
-    depsgraph,
-    offset_distance: float,
-    detection_radius: float,
-    correction_strength: float,
-    use_risk_area: bool,
-    preserve_pinned_areas: bool,
-) -> ProximityWeightsResult:
-    """
-    Compute per-vertex weights based on closest distance to the body surface.
-
-    Weight behavior:
-    - dist <= offset_distance: 1.0
-    - dist >= detection_radius: 0.0
-    - in-between: linear falloff
-
-    Notes:
-    - This is a proximity weighting pass only. The actual deformation is
-      performed by modifiers (Shrinkwrap + optional smoothing).
-    """
-    if detection_radius <= 0.0:
-        detection_radius = offset_distance
-    if detection_radius < offset_distance:
-        detection_radius = offset_distance
-
-    garment_eval = garment_obj.evaluated_get(depsgraph)
-    body_eval = body_obj.evaluated_get(depsgraph)
-
-    bvh_body = build_bvh(body_eval, depsgraph)
-
-    mesh_eval = garment_eval.to_mesh()
-    try:
-        g_mw = garment_eval.matrix_world
-
-        risk_idx = _vertex_group_index(garment_obj, CG_VG_RISK) if use_risk_area else None
-        pinned_idx = _vertex_group_index(garment_obj, CG_VG_PINNED) if preserve_pinned_areas else None
-        collar_idx = _vertex_group_index(garment_obj, CG_VG_PRESERVE_COLLAR)
-        hem_idx = _vertex_group_index(garment_obj, CG_VG_PRESERVE_HEM)
-        seams_idx = _vertex_group_index(garment_obj, CG_VG_PRESERVE_SEAMS)
-
-        weights: list[float] = [0.0] * len(mesh_eval.vertices)
-        affected = 0
-
-        # Preserve groups reduce intensity (MVP: fixed scaling).
-        preserve_scale = CORRECTION_PRESERVE_SCALE
-
-        # For group weight lookup, we read from the original mesh (stable indexing).
-        base_mesh = garment_obj.data
-
-        for i, v in enumerate(mesh_eval.vertices):
-            if risk_idx is not None:
-                risk_w = _vertex_weight(base_mesh.vertices[i], risk_idx)
-                if risk_w <= 0.0:
-                    continue
-
-            world_co = g_mw @ v.co
-            nearest = bvh_body.find_nearest(world_co)
-            if nearest is None:
-                continue
-
-            nearest_co, _, _, dist = nearest
-            if dist is None:
-                dist = (world_co - nearest_co).length
-
-            if dist >= detection_radius:
-                continue
-
-            if dist <= offset_distance or detection_radius == offset_distance:
-                base = 1.0
-            else:
-                base = (detection_radius - dist) / (detection_radius - offset_distance)
-
-            w = max(0.0, min(1.0, base)) * float(correction_strength)
-
-            if pinned_idx is not None:
-                pinned_w = _vertex_weight(base_mesh.vertices[i], pinned_idx)
-                if pinned_w > 0.0:
-                    w *= max(0.0, 1.0 - pinned_w)
-
-            preserve_w = 0.0
-            if collar_idx is not None:
-                preserve_w = max(preserve_w, _vertex_weight(base_mesh.vertices[i], collar_idx))
-            if hem_idx is not None:
-                preserve_w = max(preserve_w, _vertex_weight(base_mesh.vertices[i], hem_idx))
-            if seams_idx is not None:
-                preserve_w = max(preserve_w, _vertex_weight(base_mesh.vertices[i], seams_idx))
-
-            if preserve_w > 0.0:
-                w *= max(0.0, 1.0 - preserve_w * preserve_scale)
-
-            if w > 0.0:
-                affected += 1
-                weights[i] = w
-    finally:
-        body_eval.to_mesh_clear()
-        garment_eval.to_mesh_clear()
-
-    return ProximityWeightsResult(weights=weights, affected_count=affected)
 
 
 @dataclass(frozen=True)

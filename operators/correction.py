@@ -232,7 +232,7 @@ class CG_OT_clear_live_correction(Operator):
 class CG_OT_refresh_live_correction(Operator):
     bl_idname = "cloth_guard.refresh_live_correction"
     bl_label = "Refresh Live Correction"
-    bl_description = "Recompute proximity weights for the current pose/frame"
+    bl_description = "Recompute the live anti-clip correction (CG_LiveCorrection) for the current pose/frame"
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):

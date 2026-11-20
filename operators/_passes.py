@@ -37,13 +37,6 @@ from ..core.shape_keys import bake_live_key_into, ensure_live_correction_shapeke
 from ._common import _run_detection_and_weights
 
 
-def _get_or_create_anticlip_mod(garment_obj: bpy.types.Object) -> bpy.types.Modifier | None:
-    mod = garment_obj.modifiers.get(CG_MOD_ANTICLIP)
-    if mod is None:
-        return None
-    return mod
-
-
 def _warn_unconvertible(report_to: Operator | None, garment_obj: bpy.types.Object, frame: int, count: int, what: str) -> None:
     """
     Tell the artist when some pushes could not be converted back through the rig (degenerate deformation).
@@ -292,10 +285,6 @@ def _verify_helper_correction(
         write_weights=False,
     )
     return 0.0, det_after
-
-
-def _update_correction_weights(context, *, report_to: Operator | None = None) -> int:
-    return 0
 
 
 def _bake_live_correction_to_key(garment_obj: bpy.types.Object, name: str) -> None:
