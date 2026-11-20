@@ -24,89 +24,69 @@ bl_info = {
     "category": "Animation",
 }
 
+# Every submodule, in dependency order (a module comes after everything it imports).
+_SUBMODULES = (
+    "constants",
+    "core.debug",
+    "core.mesh_utils",
+    "core.body",
+    "core.shape_keys",
+    "core.detection",
+    "core.correction",
+    "core.shape_preservation",
+    "core.modifiers",
+    "core.drivers",
+    "core",
+    "properties",
+    "operators._common",
+    "operators._keyframes",
+    "operators._passes",
+    "operators.garments",
+    "operators.setup",
+    "operators.shape_preservation",
+    "operators.detection",
+    "operators.correction",
+    "operators.animation",
+    "operators",
+    "panels",
+)
+
+if "bpy" in locals():
+    # F3 > "Reload Scripts" (and re-enabling after a code change) re-runs only this file.
+    # Reload the submodules too, or Blender keeps running their old code.
+    import importlib
+    import sys
+
+    for _name in _SUBMODULES:
+        _module = sys.modules.get(f"{__name__}.{_name}")
+        if _module is not None:
+            importlib.reload(_module)
+
 import bpy
 
-from .operators import (
-    CG_OT_add_selected_garments,
-    CG_OT_bake_corrections,
-    CG_OT_check_garment_compatibility,
-    CG_OT_clear_live_correction,
-    CG_OT_correct_current_pose,
-    CG_OT_delete_body_mask,
-    CG_OT_create_body_mask,
-    CG_OT_store_rest_shape,
-    CG_OT_analyze_shape_drift,
-    CG_OT_generate_shape_preservation_current,
-    CG_OT_generate_shape_preservation_flagged,
-    CG_OT_create_corrective_shapekey,
-    CG_OT_detect_clipping,
-    CG_OT_detect_self_clipping,
-    CG_OT_generate_correction_current_frame,
-    CG_OT_generate_corrections_flagged_frames,
-    CG_OT_go_to_problem_frame,
-    CG_OT_clear_problem_frames,
-    CG_OT_move_garment,
-    CG_OT_remove_active_garment,
-    CG_OT_select_clipping_vertices,
-    CG_OT_select_self_clipping_vertices,
-    CG_OT_refresh_live_correction,
-    CG_OT_remove_setup,
-    CG_OT_setup,
-    CG_OT_scan_animation,
-)
-from .panels import CG_PT_main, CG_UL_garments, CG_UL_problem_frames
-from .properties import (
-    CG_GarmentItem,
-    CG_ProblemFrameItem,
-    CG_Settings,
-    register_properties,
-    unregister_properties,
-)
+from . import operators, panels, properties
 
 
-CLASSES = (
-    CG_GarmentItem,
-    CG_ProblemFrameItem,
-    CG_Settings,
-    CG_OT_add_selected_garments,
-    CG_OT_remove_active_garment,
-    CG_OT_move_garment,
-    CG_OT_setup,
-    CG_OT_remove_setup,
-    CG_OT_create_body_mask,
-    CG_OT_delete_body_mask,
-    CG_OT_store_rest_shape,
-    CG_OT_analyze_shape_drift,
-    CG_OT_generate_shape_preservation_current,
-    CG_OT_generate_shape_preservation_flagged,
-    CG_OT_detect_clipping,
-    CG_OT_select_clipping_vertices,
-    CG_OT_detect_self_clipping,
-    CG_OT_select_self_clipping_vertices,
-    CG_OT_correct_current_pose,
-    CG_OT_refresh_live_correction,
-    CG_OT_clear_live_correction,
-    CG_OT_check_garment_compatibility,
-    CG_OT_scan_animation,
-    CG_OT_clear_problem_frames,
-    CG_OT_go_to_problem_frame,
-    CG_OT_generate_correction_current_frame,
-    CG_OT_generate_corrections_flagged_frames,
-    CG_OT_create_corrective_shapekey,
-    CG_OT_bake_corrections,
-    CG_UL_garments,
-    CG_UL_problem_frames,
-    CG_PT_main,
-)
+def _classes() -> tuple:
+    # Built when called (not at import), so a reload registers the fresh classes.
+    return (
+        properties.CG_GarmentItem,
+        properties.CG_ProblemFrameItem,
+        properties.CG_Settings,
+        *operators.CLASSES,
+        panels.CG_UL_garments,
+        panels.CG_UL_problem_frames,
+        panels.CG_PT_main,
+    )
 
 
 def register():
-    for cls in CLASSES:
+    for cls in _classes():
         bpy.utils.register_class(cls)
-    register_properties()
+    properties.register_properties()
 
 
 def unregister():
-    unregister_properties()
-    for cls in reversed(CLASSES):
+    properties.unregister_properties()
+    for cls in reversed(_classes()):
         bpy.utils.unregister_class(cls)

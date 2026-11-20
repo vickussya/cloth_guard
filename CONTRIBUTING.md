@@ -4,7 +4,8 @@ Thanks for your interest in contributing to Cloth Guard.
 
 ## Development notes
 
-- This repo keeps add-on source files **flat at the repository root**.
+- The repository root is the add-on package: `core/` holds the logic, `operators/` the Blender operators (see `AGENTS.md` for the layout).
+- Run the background tests in `tests/` before sending changes.
 - Keep changes compatible with Blender **3.0+**.
 - Avoid simulation-style features; focus on stable, animator-friendly correction workflows.
 

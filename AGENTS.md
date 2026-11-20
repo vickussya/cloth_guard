@@ -12,7 +12,16 @@ Guidelines:
 
 Repository conventions:
 
-- Add-on modules live at the repo root (e.g. `__init__.py`, `operators.py`, `panels.py`, `properties.py`, `utils.py`).
+- The repo root is the add-on package (GitHub "Download ZIP" installs it as-is):
+  - `__init__.py`: `bl_info`, `register()` / `unregister()`, and the submodule reload list for F3 > Reload Scripts.
+  - `constants.py`: all `CG_*` names (vertex groups, modifiers, shape keys; saved in users' .blend files, never rename) and tuning constants.
+  - `properties.py`, `panels.py`: settings and UI.
+  - `core/`: pure logic, no Operator/Panel classes. `debug`, `mesh_utils`, `body` (body BVH per frame), `shape_keys` (live keys, rest-space conversion), `detection`, `correction`, `shape_preservation`, `modifiers`, `drivers`.
+  - `operators/`: Operator classes by feature (`garments`, `setup`, `shape_preservation`, `detection`, `correction`, `animation`) plus private helpers (`_common`, `_keyframes`, `_passes`). `operators/__init__.py` exposes `CLASSES` in registration order.
+  - `tests/`: Blender background tests (`blender -b --factory-startup --python-exit-code 1 --python tests/<test>.py`); excluded from the ZIP via `.gitattributes`.
+- Relative imports only. `core/` must never import from `operators/`, `panels.py` or `properties.py`.
+- A new submodule must be added to `_SUBMODULES` in `__init__.py` (after everything it imports), or Reload Scripts keeps its old code.
+- Every source file starts with the GPL header and a short module docstring.
 - Keep operator ids under the `cloth_guard.*` namespace.
 
 Workflow notes:

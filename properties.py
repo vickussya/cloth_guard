@@ -29,7 +29,7 @@ from bpy.props import (
 from bpy.types import Object, PropertyGroup
 from bpy.types import Collection
 
-from .utils import cg_update_modifier_visibility
+from .core.modifiers import cg_update_modifier_visibility
 
 
 def _update_live_anti_clip(self, context) -> None:

@@ -39,7 +39,8 @@ from mathutils.bvhtree import BVHTree
 
 REPO_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.dirname(REPO_DIR))
-cg_utils = importlib.import_module(os.path.basename(REPO_DIR) + ".utils")
+cg_detection = importlib.import_module(os.path.basename(REPO_DIR) + ".core.detection")
+cg_correction = importlib.import_module(os.path.basename(REPO_DIR) + ".core.correction")
 
 OFFSET = 0.01  # 1 cm, as in the bug report
 DETECTION_RADIUS = 0.02  # add-on default
@@ -95,7 +96,7 @@ def run_case(name: str, depth: float, flip_body: bool) -> bool:
     before = [_true_signed(bvh, p) for p in _garment_positions(garment)]
 
     depsgraph = bpy.context.evaluated_depsgraph_get()
-    det = cg_utils.detect_clipping(
+    det = cg_detection.detect_clipping(
         garment_obj=garment,
         body_obj=body,
         depsgraph=depsgraph,
@@ -104,7 +105,7 @@ def run_case(name: str, depth: float, flip_body: bool) -> bool:
         use_risk_area=False,
     )
 
-    stats = cg_utils.correct_current_pose(
+    stats = cg_correction.correct_current_pose(
         garment_obj=garment,
         body_obj=body,
         depsgraph=depsgraph,

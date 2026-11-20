@@ -44,7 +44,7 @@ REPO_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.dirname(REPO_DIR))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 MODULE = os.path.basename(REPO_DIR)
-cg_utils = importlib.import_module(MODULE + ".utils")
+cg_correction = importlib.import_module(MODULE + ".core.correction")
 
 from _helpers import call_capturing_console  # noqa: E402  (needs the sys.path line above)
 
@@ -128,7 +128,7 @@ def _measure(sleeve: bpy.types.Object, head: Vector, axis: Vector):
 def run_case(name: str, raise_deg: float) -> bool:
     rig, arm, sleeve, head, axis = _build(raise_deg)
     before = _measure(sleeve, head, axis)
-    stats = cg_utils.correct_current_pose(
+    stats = cg_correction.correct_current_pose(
         garment_obj=sleeve,
         body_obj=arm,
         depsgraph=bpy.context.evaluated_depsgraph_get(),

@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.1 (Unreleased)
+## 0.1.1 (2026-11-20)
 
 - Added a clear post-animation workflow (scan frames, list problem frames, jump to frames, batch generate fixes).
 - Multi-garment support (garment list UI; per-garment processing).
@@ -21,6 +21,7 @@
 - Fixed "Enable Live Anti-Clip" doing nothing, Preserve Shape failing on Blender 4.1+, per-frame baking failing on Blender 5.x, and corrective-smooth binding on Blender 3.0/3.1.
 - Scan Animation and the batch tools show progress, reuse the body data per frame (faster) and always return to the original frame.
 - Errors are reported in the status bar instead of being hidden; new "Debug Logging" option for console diagnostics.
+- Source split into `core/` (logic) and `operators/` (Blender operators) packages; no change for users (same buttons, operator ids and saved data).
 
 ## 0.1.0
 

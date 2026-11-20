@@ -24,6 +24,7 @@ Run from the repository root:
 """
 
 import addon_utils
+import importlib
 import os
 import sys
 
@@ -72,6 +73,28 @@ def _registered(op_name: str) -> bool:
         return False
 
 
+def _stale_references() -> list:
+    """
+    After a reload every module must use the CURRENT functions/classes of the other modules.
+
+    E.g. operators._common imports detect_clipping from core.detection: if core.detection was
+    reloaded after operators._common, _common would still call the old function.
+    """
+    stale = []
+    prefix = MODULE + "."
+    for name, module in list(sys.modules.items()):
+        if not name.startswith(prefix) or module is None:
+            continue
+        for attr, value in vars(module).items():
+            source = getattr(value, "__module__", None)
+            if not (callable(value) and isinstance(source, str) and source.startswith(prefix) and source != name):
+                continue
+            current = getattr(sys.modules.get(source), getattr(value, "__name__", attr), None)
+            if current is not None and current is not value:
+                stale.append(f"{name}.{attr}")
+    return stale
+
+
 def _check(label: str, cond: bool, failures: list) -> None:
     print(f"  {'OK  ' if cond else 'FAIL'} {label}")
     if not cond:
@@ -95,6 +118,23 @@ def main() -> None:
         left = [op for op in EXPECTED_OPERATORS if _registered(op)]
         _check(f"all operators unregistered (left: {left})", not left, failures)
         _check("Scene.cg_settings removed", not hasattr(bpy.types.Scene, "cg_settings"), failures)
+
+    # For an add-on in Blender's add-ons folder, F3 > Reload Scripts disables it, reloads its ROOT
+    # module (importlib.reload) and enables it again. This test loads the add-on from the repo via
+    # sys.path, where bpy.ops.script.reload() skips it, so we do exactly those three steps.
+    print("Reload Scripts (disable, reload root module, enable)")
+    addon_utils.enable(MODULE, default_set=True, handle_error=None)
+    old_detect = sys.modules[f"{MODULE}.core.detection"].detect_clipping
+    addon_utils.disable(MODULE, default_set=True, handle_error=None)
+    importlib.reload(sys.modules[MODULE])
+    addon_utils.enable(MODULE, default_set=True, handle_error=None)
+    new_detect = sys.modules[f"{MODULE}.core.detection"].detect_clipping
+    _check("submodules are re-executed (core.detection reloaded)", new_detect is not old_detect, failures)
+    stale = _stale_references()
+    _check(f"no module keeps old code from another module (stale: {stale[:3]})", not stale, failures)
+    missing = [op for op in EXPECTED_OPERATORS if not _registered(op)]
+    _check(f"all operators registered after reload (missing: {missing})", not missing, failures)
+    addon_utils.disable(MODULE, default_set=True, handle_error=None)
 
     print(f"\n{'PASS' if not failures else 'FAIL'}: {len(failures)} failure(s)")
     if failures:
