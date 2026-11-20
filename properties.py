@@ -454,6 +454,12 @@ class CG_Settings(PropertyGroup):
         unit="ROTATION",
     )
 
+    debug_logging: BoolProperty(
+        name="Debug Logging",
+        description="Print detailed Cloth Guard diagnostics to the system console (slower; for troubleshooting)",
+        default=False,
+    )
+
 
 def register_properties():
     bpy.types.Scene.cg_settings = PointerProperty(type=CG_Settings)
@@ -462,5 +468,6 @@ def register_properties():
 def unregister_properties():
     try:
         del bpy.types.Scene.cg_settings
-    except Exception:
+    except AttributeError:
+        # Never registered (register() failed part-way): nothing to remove.
         pass

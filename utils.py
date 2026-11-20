@@ -46,6 +46,43 @@ CG_SHAPEKEY_REST = "CG_RestShape"
 CG_VG_SHAPE_DRIFT = "CG_ShapeDrift"
 CG_VG_SHAPE_PRESERVE = "CG_ShapePreserve"
 
+# --- Tuning constants (values unchanged from the original inline numbers) -------------------------
+
+# Clipping detection
+PENETRATION_EPS_FRACTION = 0.05  # a vertex only counts as "inside" when deeper than 5% of the offset (noisy normals)
+DETECT_PRESERVE_CONTACT_SCALE = 0.75  # how much CG_Preserve_* groups (collar/hem/seams) lower contact weights
+DETECT_PRESERVE_CLIPPING_SCALE = 0.25  # how much CG_Preserve_* groups lower clipping weights
+BOUNDARY_CONTACT_SCALE = 0.1  # how much open edges (hem, collar) are protected from false contact hits
+BOUNDARY_CLIPPING_SCALE = 0.25  # how much open edges (hem, collar) are protected from false clipping hits
+OVERLAP_NEAR_SURFACE_FRACTION = 0.15  # an overlapping triangle counts as clipping if within 15% of the offset of the body
+OVERLAP_BORDER_MIN_WEIGHT = 0.9  # border vertices are escalated by the overlap test only if already this strongly clipping
+DETECT_DEBUG_SAMPLES = 3  # how many sample vertices detect_clipping prints with Debug Logging on
+
+# Anti-clip correction (shape-key path and the Geometry Nodes push-out)
+CORRECTION_BOUNDARY_SCALE = 0.25  # open edges (hem, collar) are pushed only 25% as far
+CORRECTION_PRESERVE_SCALE = 0.5  # at full CG_Preserve_* weight the push is halved
+
+# Shape preservation
+PRESERVE_BOUNDARY_SCALE = 0.25  # open edges get 25% of the preservation correction
+PRESERVE_GROUP_SCALE = 0.75  # at full CG_Preserve_* weight the preservation correction is reduced by 75%
+PRESERVE_MAX_DRIFT_REMOVAL = 0.75  # never remove more than 75% of a vertex's drift (avoids shrinking the garment)
+DRIFT_SIMILARITY_RANGE = 4.0  # neighbours whose drift differs by 4x the drift threshold no longer smooth each other
+MASK_PRESERVE_GROUP_SCALE = 0.9  # visual-mode mask: CG_Preserve_* groups keep 10% of the preservation
+
+# Self-clipping detection
+SELF_CLIP_PROBE_FRACTION = 0.25  # probe points sit 25% of the radius off the surface on both sides
+
+
+def log_debug(context, *args) -> None:
+    """
+    Print diagnostics only when "Debug Logging" is enabled in the Cloth Guard settings.
+
+    Callers pass the prefix themselves, e.g. log_debug(context, "[Cloth Guard][Scan]", "frame=3").
+    """
+    settings = getattr(getattr(context, "scene", None), "cg_settings", None)
+    if settings is not None and settings.debug_logging:
+        print(*args)
+
 
 def is_mesh_object(obj) -> bool:
     return obj is not None and getattr(obj, "type", None) == "MESH"
@@ -72,8 +109,9 @@ def clear_vertex_group(obj: bpy.types.Object, vg: bpy.types.VertexGroup) -> None
         for i in indices:
             try:
                 vg.remove([i])
-            except Exception:
-                pass
+            except RuntimeError:
+                # This vertex is not in the group: nothing to remove (expected, not an error).
+                continue
 
 
 def _vertex_group_index(obj: bpy.types.Object, group_name: str) -> Optional[int]:
@@ -90,6 +128,36 @@ def _vertex_weight(v: bpy.types.MeshVertex, group_index: int) -> float:
 
 def build_bvh(obj_eval: bpy.types.Object, depsgraph) -> BVHTree:
     return BVHTree.FromObject(obj_eval, depsgraph, epsilon=0.0)
+
+
+@dataclass(frozen=True)
+class BodySurface:
+    """
+    The evaluated body on one frame, ready for nearest-point queries.
+
+    Building the BVH is the expensive part, and the body does not change while garments are
+    checked and corrected on the same frame, so operators build this once per frame and pass it in.
+    """
+
+    bvh: BVHTree  # in evaluated body LOCAL space
+    matrix_world: Matrix
+    normal_sign: float  # +1 normals point out of the body, -1 the body is inside-out (see _body_normal_sign)
+
+
+def build_body_surface(body_obj: bpy.types.Object, depsgraph) -> BodySurface:
+    body_eval = body_obj.evaluated_get(depsgraph)
+    mesh = body_eval.to_mesh()
+    try:
+        mesh.calc_loop_triangles()
+        verts = [v.co.copy() for v in mesh.vertices]
+        tris = [tuple(lt.vertices) for lt in mesh.loop_triangles]
+        return BodySurface(
+            bvh=BVHTree.FromPolygons(verts, tris, all_triangles=True, epsilon=0.0),
+            matrix_world=body_eval.matrix_world.copy(),
+            normal_sign=_body_normal_sign(verts, tris),
+        )
+    finally:
+        body_eval.to_mesh_clear()
 
 
 @dataclass(frozen=True)
@@ -151,7 +219,7 @@ def _signed_volume(verts: list[Vector], tris: list[tuple[int, int, int]]) -> flo
     total = 0.0
     for a, b, c in tris:
         total += verts[a].dot(verts[b].cross(verts[c]))
-    return total / 6.0
+    return total / 6.0  # each triple product is 6x the volume of its tetrahedron
 
 
 def _body_normal_sign(verts: list[Vector], tris: list[tuple[int, int, int]]) -> float:
@@ -411,7 +479,7 @@ def _smooth_deltas_structural(
                     continue
                 # Drift similarity: if drift varies a lot across an edge, treat it as large-scale deformation and smooth less.
                 dd = float((cur[j] - cur[i]).length)
-                sim = max(0.0, 1.0 - (dd / (drift_threshold * 4.0)))
+                sim = max(0.0, 1.0 - (dd / (drift_threshold * DRIFT_SIMILARITY_RANGE)))
                 w = nd * sim
                 if w <= 0.0:
                     continue
@@ -432,6 +500,7 @@ def detect_clipping(
     offset_distance: float,
     detection_radius: float,
     use_risk_area: bool,
+    body_surface: BodySurface | None = None,
 ) -> ClipDetectionResult:
     """
     Robust MVP clipping detection on evaluated (deformed) meshes:
@@ -439,51 +508,50 @@ def detect_clipping(
     - Contact weights for near-body vertices (CG_Contact)
     - Clipping weights for likely penetration (CG_Clipping), using surface normals (dot < 0)
     - Optional overlap heuristic, gated by a secondary penetration check (reduces false positives)
+
+    body_surface: pass build_body_surface() once per frame when checking several garments.
     """
     offset_distance = max(0.0, float(offset_distance))
     detection_radius = max(offset_distance, float(detection_radius))
+    if body_surface is None:
+        body_surface = build_body_surface(body_obj, depsgraph)
 
     garment_eval = garment_obj.evaluated_get(depsgraph)
-    body_eval = body_obj.evaluated_get(depsgraph)
-
-    body_mesh = body_eval.to_mesh()
     garment_mesh = garment_eval.to_mesh()
     try:
         base_mesh = garment_obj.data
         base_vert_count = len(base_mesh.vertices)
         vertex_count_matches = len(garment_mesh.vertices) == base_vert_count
         if not vertex_count_matches:
-            print(
+            log_debug(
+                bpy.context,
                 "[Cloth Guard][Detect] WARNING: evaluated garment vertex count differs from base mesh. "
                 "Topology-changing modifiers are likely enabled; CG_Clipping mapping to the base mesh may be incomplete."
             )
 
-        body_mw = body_eval.matrix_world
+        body_mw = body_surface.matrix_world
         garment_mw = garment_eval.matrix_world
         garment_to_body = body_mw.inverted_safe() @ garment_mw
 
-        # BVH is built in evaluated BODY LOCAL SPACE.
-        body_mesh.calc_loop_triangles()
-        body_verts = [v.co.copy() for v in body_mesh.vertices]
-        body_tris = [tuple(lt.vertices) for lt in body_mesh.loop_triangles]
-        bvh_body = BVHTree.FromPolygons(body_verts, body_tris, all_triangles=True, epsilon=0.0)
-        body_normal_sign = _body_normal_sign(body_verts, body_tris)
+        # BVH is in evaluated BODY LOCAL SPACE.
+        bvh_body = body_surface.bvh
+        body_normal_sign = body_surface.normal_sign
         risk_idx = _vertex_group_index(garment_obj, CG_VG_RISK) if use_risk_area else None
 
         collar_idx = _vertex_group_index(garment_obj, CG_VG_PRESERVE_COLLAR)
         hem_idx = _vertex_group_index(garment_obj, CG_VG_PRESERVE_HEM)
         seams_idx = _vertex_group_index(garment_obj, CG_VG_PRESERVE_SEAMS)
-        preserve_scale_contact = 0.75
-        preserve_scale_clipping = 0.25
+        preserve_scale_contact = DETECT_PRESERVE_CONTACT_SCALE
+        preserve_scale_clipping = DETECT_PRESERVE_CLIPPING_SCALE
 
         # Boundary attenuation helps avoid noisy selections on open edges (collars/hem boundaries).
         boundary_mask = _boundary_vertex_mask(base_mesh)
         # Strongly protect open borders/silhouette edges from false positives.
-        boundary_contact_scale = 0.1
-        boundary_clipping_scale = 0.25
+        boundary_contact_scale = BOUNDARY_CONTACT_SCALE
+        boundary_clipping_scale = BOUNDARY_CLIPPING_SCALE
 
         # When normals are noisy or inconsistent, require a small negative dot to call it penetration.
-        penetration_eps = max(1e-6, offset_distance * 0.05)
+        penetration_eps = max(1e-6, offset_distance * PENETRATION_EPS_FRACTION)
 
         contact_weights: list[float] = [0.0] * base_vert_count
         clipping_weights: list[float] = [0.0] * base_vert_count
@@ -565,13 +633,14 @@ def detect_clipping(
                 if clip_w > clipping_weights[i]:
                     clipping_weights[i] = clip_w
 
-                if debug_printed < 3:
+                if debug_printed < DETECT_DEBUG_SAMPLES:
                     signed_txt = "n/a"
                     if nearest_no is not None:
                         vec = garment_in_body - nearest_co
                         signed_txt = f"{float(vec.dot(nearest_no)):.6f}"
                     world_co = garment_mw @ v.co
-                    print(
+                    log_debug(
+                        bpy.context,
                         "[Cloth Guard][Detect][Sample]",
                         f"idx={i}",
                         f"g_world=({world_co.x:.4f},{world_co.y:.4f},{world_co.z:.4f})",
@@ -614,7 +683,7 @@ def detect_clipping(
                     vec = centroid - nearest_co
                     if float(vec.dot(nearest_no * body_normal_sign)) < -penetration_eps:
                         penetrates = True
-                if not penetrates and dist <= (offset_distance * 0.15):
+                if not penetrates and dist <= (offset_distance * OVERLAP_NEAR_SURFACE_FRACTION):
                     penetrates = True
                 if not penetrates:
                     continue
@@ -625,7 +694,7 @@ def detect_clipping(
                         continue
                     if boundary_mask[idx]:
                         # Avoid escalating borders unless they are already strongly penetrating.
-                        if clipping_weights[idx] < 0.9:
+                        if clipping_weights[idx] < OVERLAP_BORDER_MIN_WEIGHT:
                             continue
                     # Escalate: intersection-like evidence.
                     clipping_weights[idx] = max(clipping_weights[idx], 1.0)
@@ -658,7 +727,6 @@ def detect_clipping(
             nearest_distances=nearest_distances,
         )
     finally:
-        body_eval.to_mesh_clear()
         garment_eval.to_mesh_clear()
 
 
@@ -686,16 +754,16 @@ def correct_current_pose(
     smooth_strength: float,
     use_risk_area: bool,
     preserve_pinned_areas: bool,
+    body_surface: BodySurface | None = None,
 ) -> PoseCorrectionStats:
     offset_distance = max(0.0, float(offset_distance))
     detection_radius = max(offset_distance, float(detection_radius))
     correction_strength = max(0.0, min(1.0, float(correction_strength)))
     max_push_distance = max(0.0, float(max_push_distance))
+    if body_surface is None:
+        body_surface = build_body_surface(body_obj, depsgraph)
 
     garment_eval = garment_obj.evaluated_get(depsgraph)
-    body_eval = body_obj.evaluated_get(depsgraph)
-
-    body_mesh = body_eval.to_mesh()
     garment_mesh = garment_eval.to_mesh()
     try:
         base_mesh = garment_obj.data
@@ -705,15 +773,12 @@ def correct_current_pose(
                 "For MVP correction, keep the garment modifier stack topology-stable (Armature/shape keys are OK; Subdivision/Remesh are not)."
             )
 
-        body_mw = body_eval.matrix_world
+        body_mw = body_surface.matrix_world
         garment_mw = garment_eval.matrix_world
         garment_to_body = body_mw.inverted_safe() @ garment_mw
 
-        # BVH is built in evaluated BODY LOCAL SPACE.
-        body_mesh.calc_loop_triangles()
-        body_verts = [v.co.copy() for v in body_mesh.vertices]
-        body_tris = [tuple(lt.vertices) for lt in body_mesh.loop_triangles]
-        bvh_body = BVHTree.FromPolygons(body_verts, body_tris, all_triangles=True, epsilon=0.0)
+        # BVH is in evaluated BODY LOCAL SPACE.
+        bvh_body = body_surface.bvh
 
         inv_garment_world = garment_obj.matrix_world.inverted_safe()
 
@@ -724,17 +789,17 @@ def correct_current_pose(
         seams_idx = _vertex_group_index(garment_obj, CG_VG_PRESERVE_SEAMS)
 
         boundary_mask = _boundary_vertex_mask(base_mesh)
-        boundary_scale = 0.25
+        boundary_scale = CORRECTION_BOUNDARY_SCALE
 
-        preserve_scale = 0.5
-        penetration_eps = max(1e-6, offset_distance * 0.05)
+        preserve_scale = CORRECTION_PRESERVE_SCALE
+        penetration_eps = max(1e-6, offset_distance * PENETRATION_EPS_FRACTION)
 
         deltas: list[Vector] = [Vector((0.0, 0.0, 0.0)) for _ in range(len(garment_mesh.vertices))]
         checked = 0
         corrected = 0
         nearest_distances: list[float | None] = [None] * len(garment_mesh.vertices)
 
-        body_normal_sign = _body_normal_sign(body_verts, body_tris)
+        body_normal_sign = body_surface.normal_sign
 
         def _choose_outward_normal(normal_body: Vector) -> Vector:
             return normal_body.normalized() * body_normal_sign
@@ -853,8 +918,7 @@ def correct_current_pose(
                 wd = mw3 @ d
                 max_delta = max(max_delta, float(wd.length))
     finally:
-        # Free the evaluated meshes before probing below (probing re-evaluates the scene).
-        body_eval.to_mesh_clear()
+        # Free the evaluated mesh before probing below (probing re-evaluates the scene).
         garment_eval.to_mesh_clear()
 
     # The pushes were measured on the posed garment, but a shape key is applied BEFORE the
@@ -928,7 +992,7 @@ def compute_proximity_weights(
         affected = 0
 
         # Preserve groups reduce intensity (MVP: fixed scaling).
-        preserve_scale = 0.5
+        preserve_scale = CORRECTION_PRESERVE_SCALE
 
         # For group weight lookup, we read from the original mesh (stable indexing).
         base_mesh = garment_obj.data
@@ -1161,13 +1225,13 @@ def generate_shape_preservation(
         )
 
         boundary_mask = _boundary_vertex_mask(base_mesh) if protect_borders else [False] * len(base_mesh.vertices)
-        boundary_scale = 0.25
+        boundary_scale = PRESERVE_BOUNDARY_SCALE
 
         pinned_idx = _vertex_group_index(garment_obj, CG_VG_PINNED) if protect_groups else None
         collar_idx = _vertex_group_index(garment_obj, CG_VG_PRESERVE_COLLAR) if protect_groups else None
         hem_idx = _vertex_group_index(garment_obj, CG_VG_PRESERVE_HEM) if protect_groups else None
         seams_idx = _vertex_group_index(garment_obj, CG_VG_PRESERVE_SEAMS) if protect_groups else None
-        preserve_scale = 0.75
+        preserve_scale = PRESERVE_GROUP_SCALE
 
         changed = 0
         max_delta_world = 0.0
@@ -1221,8 +1285,8 @@ def generate_shape_preservation(
             # Clamp: never remove more than a fraction of the local drift magnitude (avoids global pull/size shrink).
             drift_len = float(drift[i].length)
             corr_len = float(corr.length)
-            if drift_len > 1e-8 and corr_len > drift_len * 0.75:
-                corr *= (drift_len * 0.75) / max(corr_len, 1e-12)
+            if drift_len > 1e-8 and corr_len > drift_len * PRESERVE_MAX_DRIFT_REMOVAL:
+                corr *= (drift_len * PRESERVE_MAX_DRIFT_REMOVAL) / max(corr_len, 1e-12)
 
             corrections.append(corr)
 
@@ -1491,7 +1555,7 @@ def ensure_anticlip_modifiers(
         n_pres_scale = nodes.new("ShaderNodeMath")
         n_pres_scale.location = (150, -650)
         n_pres_scale.operation = "MULTIPLY"
-        n_pres_scale.inputs[1].default_value = 0.5
+        n_pres_scale.inputs[1].default_value = CORRECTION_PRESERVE_SCALE
 
         n_one_minus_pres = nodes.new("ShaderNodeMath")
         n_one_minus_pres.location = (300, -650)
@@ -1628,19 +1692,20 @@ def ensure_anticlip_modifiers(
             idx_sm = int(garment_obj.modifiers.find(mod_sm.name))
             if idx_sm >= 0:
                 garment_obj.modifiers.move(idx_sm, len(garment_obj.modifiers) - 1)
-        except Exception:
-            pass
+        except RuntimeError as e:
+            # Blender refuses the move (e.g. linked / library-override stack); smoothing still works,
+            # just not at the very end of the stack.
+            log_debug(bpy.context, "[Cloth Guard][AntiClip] could not move", mod_sm.name, "to the end:", e)
     else:
         if mod_sm is not None:
             # Don't delete user modifiers; CG_Smooth is add-on owned, so safe to remove.
             try:
                 garment_obj.modifiers.remove(mod_sm)
-            except Exception:
-                try:
-                    mod_sm.show_viewport = False
-                    mod_sm.show_render = False
-                except Exception:
-                    pass
+            except RuntimeError as e:
+                # Blender refuses to remove it (e.g. linked / library-override stack): switch it off instead.
+                log_debug(bpy.context, "[Cloth Guard][AntiClip] could not remove", mod_sm.name, "- hiding it:", e)
+                mod_sm.show_viewport = False
+                mod_sm.show_render = False
             mod_sm = None
 
     return mod_ac, mod_sm
@@ -1709,7 +1774,7 @@ def detect_self_clipping(
         flagged = 0
         min_d = None
 
-        eps = max(1e-6, radius * 0.25)
+        eps = max(1e-6, radius * SELF_CLIP_PROBE_FRACTION)
 
         for i, v in enumerate(mesh_eval.vertices):
             checked += 1
@@ -1791,7 +1856,7 @@ def compute_shape_preserve_mask_weights(
             preserve_w = max(preserve_w, _vertex_weight(v, seams_idx))
         if preserve_w > 0.0:
             # Strongly protect these regions.
-            scale *= max(0.0, 1.0 - preserve_w * 0.9)
+            scale *= max(0.0, 1.0 - preserve_w * MASK_PRESERVE_GROUP_SCALE)
 
         weights[i] *= scale
 
@@ -1823,8 +1888,9 @@ def ensure_shape_preserve_modifier(
     if hasattr(mod, "rest_source"):
         try:
             mod.rest_source = "BIND"
-        except Exception:
-            pass
+        except TypeError as e:
+            # "BIND" is not a valid rest source in this Blender version; the modifier keeps its default.
+            log_debug(bpy.context, "[Cloth Guard][ShapePreserve] rest_source BIND not available:", e)
     if hasattr(mod, "scale"):
         mod.scale = 1.0
 

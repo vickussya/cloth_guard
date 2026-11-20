@@ -45,7 +45,9 @@ class CG_UL_garments(UIList):
                     )
                 if not has_rest:
                     has_rest = bool(item.object.get("cg_rest_success", 0))
-            except Exception:
+            except (AttributeError, ReferenceError):
+                # draw() runs on every redraw and must never fail (that would blank the whole panel).
+                # Non-mesh data or an object deleted a moment ago: show "Rest: Missing".
                 has_rest = False
             row.label(
                 text=("Rest: Stored" if has_rest else "Rest: Missing"),
@@ -228,3 +230,5 @@ class CG_PT_main(Panel):
         col.separator()
         col.prop(settings, "use_risk_area")
         col.prop(settings, "preserve_pinned_areas")
+        col.separator()
+        col.prop(settings, "debug_logging")

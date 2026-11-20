@@ -17,7 +17,7 @@
 bl_info = {
     "name": "Cloth Guard",
     "author": "Vickussya",
-    "version": (0, 1, 0),
+    "version": (0, 1, 1),
     "blender": (3, 0, 0),
     "location": "3D View > Sidebar > Cloth Guard",
     "description": "Post-animation garment cleanup: preserve stylized shapes and reduce body clipping without cloth simulation",

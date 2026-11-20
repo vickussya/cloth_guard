@@ -43,6 +43,7 @@ from _helpers import call_capturing_console  # noqa: E402  (needs the sys.path l
 DEPTH = 0.01  # garment starts 1 cm inside the body
 
 FAILURES: list = []
+LAST_OUTPUT = {"text": ""}  # console text of the most recent run_op()
 
 
 def check(label: str, cond: bool, detail: str = "") -> None:
@@ -54,6 +55,7 @@ def check(label: str, cond: bool, detail: str = "") -> None:
 def run_op(name: str, **kwargs) -> set:
     """Run bpy.ops.cloth_guard.<name>; any Warning/Error report or Python traceback is a failure."""
     result, text = call_capturing_console(lambda: getattr(bpy.ops.cloth_guard, name)(**kwargs))
+    LAST_OUTPUT["text"] = text
     bad = [
         ln.strip()
         for ln in text.splitlines()
@@ -112,6 +114,7 @@ def _new_scene(subdivide_garment: bool = False):
         garment.modifiers.new("Subdivision", "SUBSURF").levels = 1
     settings = scene.cg_settings
     settings.body_object = body
+    settings.debug_logging = True  # run every diagnostic line too (catches broken log calls)
     scene.frame_set(1)  # before selecting: the first frame_set after creating objects resets selection
     for o in bpy.context.view_layer.objects:
         o.select_set(o == garment)
@@ -171,10 +174,13 @@ def test_shape_key_workflow() -> None:
 
     # --- Scan + Generate Corrections (All Flagged Frames)
     settings.scan_start_frame, settings.scan_end_frame, settings.scan_frame_step = 1, 3, 1
+    scene.frame_set(2)
     run_op("scan_animation")
+    check("scan puts the artist back on their frame", scene.frame_current == 2, f"frame={scene.frame_current}")
     flagged = sorted(int(it.frame) for it in settings.problem_frames)
     check("scan flags frames 2 and 3 (frame 1 is already fixed)", flagged == [2, 3], f"flagged={flagged}")
     run_op("generate_corrections_flagged_frames")
+    check("batch puts the artist back on their frame", scene.frame_current == 2, f"frame={scene.frame_current}")
     for frame in (1, 2, 3):
         scene.frame_set(frame)
         s = _signed_distances(body, garment)
@@ -232,6 +238,14 @@ def test_helper_workflow() -> None:
     print("   after: ", _summary(after))
     check("helper mode: every evaluated vertex outside the body", min(after) > 0.0)
     check("helper mode: nothing pushed inward", all(a >= b - 1e-6 for a, b in zip(after, before)))
+
+    # "Never keep a worse correction" must SEE the Geometry Nodes correction it is judging.
+    run_op("correct_current_pose")
+    line = next((ln for ln in LAST_OUTPUT["text"].splitlines() if "remaining (helper mode)" in ln), "")
+    words = line.split()
+    remaining = int(words[words.index("remaining") - 1]) if "remaining" in words else -1
+    check("helper verification sees the correction (0 remaining)", remaining == 0, line.strip()[:160])
+    check("helper verification keeps the push (weights not wiped)", min(_signed_distances(body, garment)) > 0.0)
     check("base mesh vertex count unchanged (48x24 UV sphere = 1106)", len(garment.data.vertices) == 1106)
 
 

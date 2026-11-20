@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import traceback
 from contextlib import contextmanager
 
 import bpy
@@ -35,9 +36,11 @@ from .utils import (
     CG_VG_SHAPE_PRESERVE,
     CG_SHAPEKEY_REST,
     CG_SHAPEKEY_LIVE_PRESERVE,
+    BodySurface,
     add_shapekey_driver_rotation_range,
     anticlip_strength_base,
     bake_live_key_into,
+    build_body_surface,
     gn_modifier_input,
     set_gn_modifier_input,
     build_bvh,
@@ -53,6 +56,7 @@ from .utils import (
     ensure_shape_preserve_modifier,
     ensure_vertex_group,
     is_mesh_object,
+    log_debug,
     store_rest_shape,
     analyze_shape_drift,
     generate_shape_preservation,
@@ -63,6 +67,15 @@ from .utils import (
 # NOTE: Keep operator ids under the `cloth_guard.*` namespace (AGENTS.md).
 
 _NON_DESTRUCTIVE_MSG = "Cloth Guard is non-destructive: it does not change topology or vertex order."
+
+# "Never keep a worse correction" loops (values unchanged from the original inline numbers)
+MAX_CORRECTION_PASSES = 5  # upper limit for the Correction Passes setting
+ATTEMPTS_PER_PASS = 4  # tries per pass before a pass is rejected
+HELPER_VERIFY_ATTEMPTS = 5  # tries for the Geometry Nodes helper before it is switched off
+RETRY_STRENGTH_FACTOR = 0.5  # every rejected try halves the strength
+
+SCAN_LOG_EVERY_STEPS = 10  # Scan Animation prints a debug line every 10 frame steps
+PROBLEM_FRAME_DETAILS_MAX_CHARS = 1024  # same as maxlen of CG_ProblemFrameItem.details
 
 _TOPOLOGY_MODIFIER_TYPES = {
     # Common topology-changing modifiers
@@ -125,8 +138,9 @@ def _temporarily_disable_modifiers(obj: bpy.types.Object, mods: list[bpy.types.M
             try:
                 mod.show_viewport = sv
                 mod.show_render = sr
-            except Exception:
-                pass
+            except ReferenceError:
+                # The modifier was deleted while it was switched off: nothing left to restore.
+                log_debug(bpy.context, "[Cloth Guard][Modifiers] modifier removed before it could be restored")
 
 
 def _compatibility_report_line(
@@ -168,25 +182,34 @@ def _set_rest_status_props(
         garment_obj["cg_rest_base_verts"] = int(base_count)
         garment_obj["cg_rest_eval_verts"] = int(eval_count)
         garment_obj["cg_rest_success"] = int(1 if success else 0)
-    except Exception:
-        pass
+    except (TypeError, AttributeError) as e:
+        # Linked / library-override objects can refuse custom properties. This is only the
+        # "Rest: Stored" UI hint, so the rest-shape operation itself is not failed for it.
+        log_debug(bpy.context, "[Cloth Guard][Rest] could not save status on", garment_obj.name, e)
 
 
 def _bind_corrective_smooth(context, *, obj: bpy.types.Object, modifier_name: str) -> bool:
     """
     Bind a Corrective Smooth modifier using a reliable override so it actually persists.
     """
+    override = {
+        "object": obj,
+        "active_object": obj,
+        "selected_objects": [obj],
+        "selected_editable_objects": [obj],
+    }
     try:
-        with context.temp_override(
-            object=obj,
-            active_object=obj,
-            selected_objects=[obj],
-            selected_editable_objects=[obj],
-        ):
-            res = bpy.ops.object.correctivesmooth_bind(modifier=modifier_name)
+        # context.temp_override() exists since Blender 3.2; older versions take an override dict.
+        if bpy.app.version >= (3, 2, 0):
+            with context.temp_override(**override):
+                res = bpy.ops.object.correctivesmooth_bind(modifier=modifier_name)
+        else:
+            legacy = context.copy()
+            legacy.update(override)
+            res = bpy.ops.object.correctivesmooth_bind(legacy, modifier=modifier_name)
         return bool("FINISHED" in res)
-    except Exception as e:
-        print("[Cloth Guard][RestBind] bind failed:", obj.name, modifier_name, e)
+    except RuntimeError as e:  # bpy.ops raises RuntimeError when poll fails or the operator errors
+        log_debug(context, "[Cloth Guard][RestBind] bind failed:", obj.name, modifier_name, e)
         return False
 
 
@@ -226,10 +249,7 @@ def _keyframe_modifier_strength(*, garment_obj: bpy.types.Object, mod_name: str,
             return
         owner, prop_path = ref
         set_gn_modifier_input(mod, "Factor", float(value))
-        try:
-            owner.keyframe_insert(data_path=prop_path, frame=int(frame))
-        except Exception:
-            return
+        owner.keyframe_insert(data_path=prop_path, frame=int(frame))
         ad = garment_obj.animation_data
         if ad is None or ad.action is None:
             return
@@ -247,10 +267,7 @@ def _keyframe_modifier_strength(*, garment_obj: bpy.types.Object, mod_name: str,
         return
     base = anticlip_strength_base(garment_obj, mod, 1.0)
     mod.strength = float(value) * float(base)
-    try:
-        mod.keyframe_insert(data_path="strength", frame=int(frame))
-    except Exception:
-        return
+    mod.keyframe_insert(data_path="strength", frame=int(frame))
 
     ad = garment_obj.animation_data
     if ad is None or ad.action is None:
@@ -271,12 +288,19 @@ def _run_detection_and_weights(
     garment_obj: bpy.types.Object,
     body_obj: bpy.types.Object,
     depsgraph,
+    body_surface: BodySurface | None = None,
     offset_distance: float | None = None,
     detection_radius: float | None = None,
+    keep_enabled: tuple[str, ...] = (),
+    write_weights: bool = True,
 ) -> tuple[object, int, int]:
     """
     Detect and write CG_Contact/CG_Clipping weights safely, using cage mode if enabled.
-    Returns (detection_result, contact_affected, clipping_affected).
+
+    keep_enabled: modifier names that stay on in cage mode (e.g. CG_AntiClip when verifying it).
+    write_weights: False only measures. Verification must not rewrite CG_Clipping, because that group
+    tells the CG_AntiClip modifier which vertices to push.
+    Returns (detection_result, contact_affected, clipping_affected); counts are 0 when not writing.
     """
     if offset_distance is None:
         offset_distance = float(settings.offset_distance)
@@ -292,6 +316,7 @@ def _run_detection_and_weights(
         mods = _likely_topology_modifiers(garment_obj)
     else:
         mods = _likely_topology_modifiers(garment_obj) if settings.ignore_topology_modifiers else []
+    mods = [m for m in mods if m.name not in keep_enabled]
 
     with _temporarily_disable_modifiers(garment_obj, mods):
         if mods:
@@ -301,6 +326,7 @@ def _run_detection_and_weights(
             garment_obj=garment_obj,
             body_obj=body_obj,
             depsgraph=depsgraph,
+            body_surface=body_surface,
             offset_distance=offset_distance,
             detection_radius=detection_radius,
             use_risk_area=settings.use_risk_area,
@@ -311,6 +337,8 @@ def _run_detection_and_weights(
         # helper/modifier mode was never chosen.
         context.view_layer.update()
 
+    if not write_weights:
+        return det, 0, 0
     contact_affected = write_weights_to_vertex_group(garment_obj, CG_VG_CONTACT, det.contact_weights)
     clipping_affected = write_weights_to_vertex_group(garment_obj, CG_VG_CLIPPING, det.clipping_weights)
     return det, contact_affected, clipping_affected
@@ -318,6 +346,29 @@ def _run_detection_and_weights(
 
 def _topology_mismatch(*, garment_obj: bpy.types.Object, depsgraph) -> bool:
     return _base_vertex_count(garment_obj) != _eval_vertex_count(garment_obj, depsgraph)
+
+
+def _report_garment_error(
+    op: Operator,
+    context,
+    garment_obj: bpy.types.Object,
+    action: str,
+    exc: Exception,
+    *,
+    frame: int | None = None,
+    level: str = "WARNING",
+) -> None:
+    """
+    Report one garment's failure in the status bar; the operator then continues with the others.
+
+    Operators catch a broad Exception per garment on purpose: the Blender calls inside (depsgraph
+    evaluation, modifier binds, shape keys on linked/overridden data) can fail in many ways, and one
+    bad garment must not cancel the work already done on the others. It is never silent: the artist
+    sees the error type and message, and the full traceback is printed with Debug Logging on.
+    """
+    where = f" @ frame {frame}" if frame is not None else ""
+    op.report({level}, f"{garment_obj.name}{where}: {action} failed ({type(exc).__name__}: {exc})")
+    log_debug(context, "[Cloth Guard][Error]", traceback.format_exc())
 
 
 def _warn_unconvertible(report_to: Operator | None, garment_obj: bpy.types.Object, frame: int, count: int, what: str) -> None:
@@ -345,6 +396,7 @@ def _run_shape_key_passes(
     garment_obj: bpy.types.Object,
     body_obj: bpy.types.Object,
     depsgraph,
+    body_surface: BodySurface | None = None,
     report_to: Operator | None = None,
 ) -> tuple[object, object, int]:
     """
@@ -353,8 +405,10 @@ def _run_shape_key_passes(
     report_to: operator that receives the "could not convert through the rig" warning.
     Returns: (det_before, det_after, passes_used)
     """
+    if body_surface is None:
+        body_surface = build_body_surface(body_obj, depsgraph)
     passes = int(getattr(settings, "correction_passes", 1))
-    passes = max(1, min(5, passes))
+    passes = max(1, min(MAX_CORRECTION_PASSES, passes))
 
     target_offset = max(0.0, float(settings.offset_distance + settings.safety_margin))
     det_before, contact_affected, clipping_affected = _run_detection_and_weights(
@@ -363,6 +417,7 @@ def _run_shape_key_passes(
         garment_obj=garment_obj,
         body_obj=body_obj,
         depsgraph=depsgraph,
+        body_surface=body_surface,
         offset_distance=target_offset,
         detection_radius=max(target_offset, settings.detection_radius),
     )
@@ -415,11 +470,12 @@ def _run_shape_key_passes(
             stats = None
 
             snap = _snapshot_keyblock(live_kb)
-            for attempt in range(4):
+            for attempt in range(ATTEMPTS_PER_PASS):
                 stats = correct_current_pose(
                     garment_obj=garment_obj,
                     body_obj=body_obj,
                     depsgraph=depsgraph,
+                    body_surface=body_surface,
                     offset_distance=target_offset,
                     detection_radius=max(target_offset, settings.detection_radius),
                     correction_strength=attempt_strength,
@@ -439,6 +495,7 @@ def _run_shape_key_passes(
                     garment_obj=garment_obj,
                     body_obj=body_obj,
                     depsgraph=depsgraph,
+                    body_surface=body_surface,
                     offset_distance=target_offset,
                     detection_radius=max(target_offset, settings.detection_radius),
                 )
@@ -447,7 +504,7 @@ def _run_shape_key_passes(
                     _restore_keyblock(live_kb, snap)
                     context.view_layer.update()
                     depsgraph = context.evaluated_depsgraph_get()
-                    attempt_strength *= 0.5
+                    attempt_strength *= RETRY_STRENGTH_FACTOR
                     continue
 
                 accepted = True
@@ -455,7 +512,8 @@ def _run_shape_key_passes(
                 unconvertible = max(unconvertible, int(stats.unconvertible_verts))
                 break
 
-            print(
+            log_debug(
+                context,
                 "[Cloth Guard][Pass]",
                 garment_obj.name,
                 f"pass={p+1}/{passes}",
@@ -510,7 +568,7 @@ class CG_OT_check_garment_compatibility(Operator):
                     mods=mods,
                 )
                 lines.append(line)
-                print("[Cloth Guard][Compat]", line)
+                log_debug(context, "[Cloth Guard][Compat]", line)
 
             if bad > 0:
                 self.report(
@@ -557,8 +615,10 @@ def _temporary_mode_object(context):
             try:
                 view_layer.objects.active = prev_active
                 bpy.ops.object.mode_set(mode=prev_mode)
-            except Exception:
-                pass
+            except (RuntimeError, ReferenceError) as e:
+                # mode_set's poll failed or the object was deleted: the work is done, only the
+                # artist's previous mode could not be restored.
+                log_debug(context, "[Cloth Guard][Mode] could not restore mode", prev_mode, e)
 
 
 def _garments_from_list(settings):
@@ -632,6 +692,7 @@ def _verify_helper_correction(
     garment_obj: bpy.types.Object,
     body_obj: bpy.types.Object,
     depsgraph,
+    body_surface: BodySurface | None = None,
     det_before,
     target_offset: float,
 ) -> tuple[float, object]:
@@ -639,6 +700,8 @@ def _verify_helper_correction(
     Apply helper correction (GN/Displace) and verify it does not worsen body clipping.
     Returns (accepted_factor, det_after_best).
     """
+    if body_surface is None:
+        body_surface = build_body_surface(body_obj, depsgraph)
     factor = 1.0
     det_best = det_before
 
@@ -651,7 +714,7 @@ def _verify_helper_correction(
             return True
         return False
 
-    for _ in range(5):
+    for _ in range(HELPER_VERIFY_ATTEMPTS):
         _set_anticlip_helper_factor(garment_obj=garment_obj, value=factor)
         context.view_layer.update()
         depsgraph = context.evaluated_depsgraph_get()
@@ -661,11 +724,16 @@ def _verify_helper_correction(
             garment_obj=garment_obj,
             body_obj=body_obj,
             depsgraph=depsgraph,
+            body_surface=body_surface,
             offset_distance=target_offset,
             detection_radius=max(target_offset, settings.detection_radius),
+            # Measure WITH the correction (cage mode would switch CG_AntiClip off too), and do not
+            # rewrite CG_Clipping: the modifier reads it, so fixed vertices would lose their push.
+            keep_enabled=(CG_MOD_ANTICLIP,),
+            write_weights=False,
         )
         if _is_worse(det_best, det_after):
-            factor *= 0.5
+            factor *= RETRY_STRENGTH_FACTOR
             continue
         det_best = det_after
         return float(factor), det_best
@@ -680,8 +748,11 @@ def _verify_helper_correction(
         garment_obj=garment_obj,
         body_obj=body_obj,
         depsgraph=depsgraph,
+        body_surface=body_surface,
         offset_distance=target_offset,
         detection_radius=max(target_offset, settings.detection_radius),
+        keep_enabled=(CG_MOD_ANTICLIP,),
+        write_weights=False,
     )
     return 0.0, det_after
 
@@ -1025,7 +1096,8 @@ class CG_OT_store_rest_shape(Operator):
                     topo_mods = _likely_topology_modifiers(garment_obj)
                     mismatch = base_count != eval_count
 
-                    print(
+                    log_debug(
+                        context,
                         "[Cloth Guard][Rest][Debug]",
                         garment_obj.name,
                         f"base={base_count}",
@@ -1068,12 +1140,12 @@ class CG_OT_store_rest_shape(Operator):
                                 f"{garment_obj.name}: failed to store evaluated rest shape (modifier bind). "
                                 "Make sure the garment is selectable and try again. See console for details.",
                             )
-                            print("[Cloth Guard][RestBind] FAILED", garment_obj.name, "modifier", mod.name)
+                            log_debug(context, "[Cloth Guard][RestBind] FAILED", garment_obj.name, "modifier", mod.name)
                             continue
 
                         stored += 1
                         self.report({"INFO"}, f"Stored evaluated rest shape for {garment_obj.name} ({eval_count} verts) using {mode}.")
-                        print("[Cloth Guard][RestBind] OK", garment_obj.name, "modifier", mod.name)
+                        log_debug(context, "[Cloth Guard][RestBind] OK", garment_obj.name, "modifier", mod.name)
                         continue
 
                     # Topology-stable: store an exact per-vertex rest shape key.
@@ -1089,8 +1161,8 @@ class CG_OT_store_rest_shape(Operator):
                     )
                     stored += 1
                     self.report({"INFO"}, f"Stored rest shape for {garment_obj.name}: {written} vertices using {mode}.")
-                    print("[Cloth Guard][Rest] OK", garment_obj.name, f"written={written}", mode)
-                except Exception as e:
+                    log_debug(context, "[Cloth Guard][Rest] OK", garment_obj.name, f"written={written}", mode)
+                except Exception as e:  # per-garment boundary, see _report_garment_error
                     _set_rest_status_props(
                         garment_obj,
                         mode="ERROR",
@@ -1098,7 +1170,7 @@ class CG_OT_store_rest_shape(Operator):
                         eval_count=0,
                         success=False,
                     )
-                    self.report({"WARNING"}, f"{garment_obj.name}: failed to store rest shape: {e}")
+                    _report_garment_error(self, context, garment_obj, "storing the rest shape", e)
 
             self.report({"INFO"}, f"Stored rest shape for {stored} garment(s) (non-destructive)")
         return {"FINISHED"}
@@ -1145,9 +1217,9 @@ class CG_OT_analyze_shape_drift(Operator):
                         {"INFO"},
                         f"{garment_obj.name}: drift flagged {stats.flagged_verts}/{stats.checked_verts}; max {stats.max_drift_distance:.6f} m; avg {avg_txt}",
                     )
-                    print("[Cloth Guard][Drift]", garment_obj.name, f"flagged={stats.flagged_verts}", f"max={stats.max_drift_distance:.6f}")
-                except Exception as e:
-                    self.report({"WARNING"}, f"{garment_obj.name}: drift analysis failed: {e}")
+                    log_debug(context, "[Cloth Guard][Drift]", garment_obj.name, f"flagged={stats.flagged_verts}", f"max={stats.max_drift_distance:.6f}")
+                except Exception as e:  # per-garment boundary, see _report_garment_error
+                    _report_garment_error(self, context, garment_obj, "drift analysis", e)
 
             if analyzed == 0:
                 self.report({"ERROR"}, "No garments analyzed. Store Rest Shape first.")
@@ -1226,10 +1298,10 @@ class CG_OT_generate_shape_preservation_current(Operator):
                         continue
                     done += 1
                     self.report({"INFO"}, f"{garment_obj.name}: preserve changed {changed} verts; max delta {max_d:.6f} m")
-                    print("[Cloth Guard][Preserve]", garment_obj.name, f"changed={changed}", f"max_delta={max_d:.6f}")
-                except Exception as e:
+                    log_debug(context, "[Cloth Guard][Preserve]", garment_obj.name, f"changed={changed}", f"max_delta={max_d:.6f}")
+                except Exception as e:  # per-garment boundary, see _report_garment_error
                     failed += 1
-                    self.report({"WARNING"}, f"{garment_obj.name}: shape preservation failed: {e}")
+                    _report_garment_error(self, context, garment_obj, "shape preservation", e)
 
             if done == 0:
                 if missing_rest == len(garments):
@@ -1272,9 +1344,12 @@ class CG_OT_generate_shape_preservation_flagged(Operator):
         prev_active = view_layer.objects.active
 
         baked = 0
+        wm = context.window_manager
+        wm.progress_begin(0, len(frames))  # progress counter so Blender does not look frozen
         try:
             with _temporary_mode_object(context):
-                for frame in frames:
+                for frame_index, frame in enumerate(frames):
+                    wm.progress_update(frame_index)
                     scene.frame_set(frame)
                     depsgraph = context.evaluated_depsgraph_get()
                     for garment_obj in garments:
@@ -1337,11 +1412,12 @@ class CG_OT_generate_shape_preservation_flagged(Operator):
                             _keyframe_shapekey_value(garment_obj=garment_obj, key_name=key_name, frame=frame, value=1.0)
                             _keyframe_shapekey_value(garment_obj=garment_obj, key_name=key_name, frame=frame + 1, value=0.0)
                             baked += 1
-                            print("[Cloth Guard][PreserveBake]", garment_obj.name, f"frame={frame}", f"key={key_name}", f"max_delta={max_d:.6f}")
-                        except Exception as e:
-                            self.report({"WARNING"}, f"{garment_obj.name} @ {frame}: preserve bake failed: {e}")
+                            log_debug(context, "[Cloth Guard][PreserveBake]", garment_obj.name, f"frame={frame}", f"key={key_name}", f"max_delta={max_d:.6f}")
+                        except Exception as e:  # per-garment boundary, see _report_garment_error
+                            _report_garment_error(self, context, garment_obj, "preserve bake", e, frame=frame)
                 settings.enable_live_anti_clip = True
         finally:
+            wm.progress_end()
             scene.frame_set(prev_frame)
             view_layer.objects.active = prev_active
 
@@ -1365,6 +1441,7 @@ class CG_OT_detect_clipping(Operator):
 
         with _temporary_mode_object(context):
             depsgraph = context.evaluated_depsgraph_get()
+            body_surface = build_body_surface(body_obj, depsgraph)  # once per frame, shared by every garment
             total_checked = 0
             total_candidates = 0
             total_contact = 0
@@ -1379,11 +1456,12 @@ class CG_OT_detect_clipping(Operator):
                         garment_obj=garment_obj,
                         body_obj=body_obj,
                         depsgraph=depsgraph,
+                        body_surface=body_surface,
                         offset_distance=max(0.0, float(settings.offset_distance + settings.safety_margin)),
                         detection_radius=max(float(settings.offset_distance + settings.safety_margin), settings.detection_radius),
                     )
-                except Exception as e:
-                    self.report({"WARNING"}, f"{garment_obj.name}: {e}")
+                except Exception as e:  # per-garment boundary, see _report_garment_error
+                    _report_garment_error(self, context, garment_obj, "clipping detection", e)
                     continue
 
                 s = res.stats
@@ -1399,7 +1477,8 @@ class CG_OT_detect_clipping(Operator):
                     )
 
                 min_txt = f"{s.min_nearest_distance:.6f} m" if s.min_nearest_distance is not None else "n/a"
-                print(
+                log_debug(
+                    context,
                     "[Cloth Guard][Detect]",
                     garment_obj.name,
                     f"checked={s.checked_verts}",
@@ -1513,7 +1592,8 @@ class CG_OT_detect_self_clipping(Operator):
                         global_min = stats.min_distance if global_min is None else min(global_min, stats.min_distance)
 
                     min_txt = f"{stats.min_distance:.6f} m" if stats.min_distance is not None else "n/a"
-                    print(
+                    log_debug(
+                        context,
                         "[Cloth Guard][SelfClip]",
                         garment_obj.name,
                         f"checked={int(stats.checked_verts)}",
@@ -1521,8 +1601,8 @@ class CG_OT_detect_self_clipping(Operator):
                         f"min={min_txt}",
                         ("cage=ON" if mods else "cage=OFF"),
                     )
-                except Exception as e:
-                    self.report({"WARNING"}, f"{garment_obj.name}: self-clipping detect failed: {e}")
+                except Exception as e:  # per-garment boundary, see _report_garment_error
+                    _report_garment_error(self, context, garment_obj, "self-clipping detection", e)
 
         global_min_txt = f"{global_min:.6f} m" if global_min is not None else "n/a"
         self.report(
@@ -1602,6 +1682,7 @@ class CG_OT_correct_current_pose(Operator):
 
         with _temporary_mode_object(context):
             depsgraph = context.evaluated_depsgraph_get()
+            body_surface = build_body_surface(body_obj, depsgraph)  # once per frame, shared by every garment
 
             total_checked = 0
             total_candidates = 0
@@ -1619,11 +1700,12 @@ class CG_OT_correct_current_pose(Operator):
                         garment_obj=garment_obj,
                         body_obj=body_obj,
                         depsgraph=depsgraph,
+                        body_surface=body_surface,
                         offset_distance=target_offset,
                         detection_radius=max(target_offset, settings.detection_radius),
                     )
-                except Exception as e:
-                    self.report({"WARNING"}, f"{garment_obj.name}: {e}")
+                except Exception as e:  # per-garment boundary, see _report_garment_error
+                    _report_garment_error(self, context, garment_obj, "clipping detection", e)
                     continue
 
                 # Mode selection:
@@ -1664,15 +1746,12 @@ class CG_OT_correct_current_pose(Operator):
                             garment_obj=garment_obj,
                             body_obj=body_obj,
                             depsgraph=depsgraph,
+                            body_surface=body_surface,
                             det_before=det,
                             target_offset=target_offset,
                         )
                         after_clipping = int(det_after.stats.flagged_clipping)
-                        max_w = 0.0
-                        try:
-                            max_w = float(max(det.clipping_weights)) if getattr(det, "clipping_weights", None) else 0.0
-                        except Exception:
-                            max_w = 0.0
+                        max_w = float(max(det.clipping_weights)) if det.clipping_weights else 0.0
                         base = anticlip_strength_base(
                             garment_obj, garment_obj.modifiers.get(CG_MOD_ANTICLIP), float(target_offset)
                         )
@@ -1686,8 +1765,8 @@ class CG_OT_correct_current_pose(Operator):
                             f"smoothing={'ON' if str(getattr(settings, 'anticlip_mode', 'SAFE_PUSHOUT'))=='SMART' else 'OFF'}; "
                             f"shrink_protect={protect_txt}; verify={accept_txt}",
                         )
-                    except Exception as e:
-                        self.report({"ERROR"}, f"{garment_obj.name}: helper/modifier correction failed: {e}")
+                    except Exception as e:  # per-garment boundary, see _report_garment_error
+                        _report_garment_error(self, context, garment_obj, "helper/modifier correction", e, level="ERROR")
                     continue
 
                 try:
@@ -1697,6 +1776,7 @@ class CG_OT_correct_current_pose(Operator):
                         garment_obj=garment_obj,
                         body_obj=body_obj,
                         depsgraph=depsgraph,
+                        body_surface=body_surface,
                         report_to=self,
                     )
                     after_clipping = int(det_after.stats.flagged_clipping)
@@ -1709,8 +1789,8 @@ class CG_OT_correct_current_pose(Operator):
                         f"smoothing={'ON' if str(getattr(settings, 'anticlip_mode', 'SAFE_PUSHOUT'))=='SMART' else 'OFF'}; "
                         f"shrink_protect={protect_txt}",
                     )
-                except Exception as e:
-                    self.report({"ERROR"}, f"{garment_obj.name}: correction failed: {e}")
+                except Exception as e:  # per-garment boundary, see _report_garment_error
+                    _report_garment_error(self, context, garment_obj, "correction", e, level="ERROR")
                     continue
 
                 # Update global summary using before detection stats (stable) and after for min.
@@ -1734,7 +1814,7 @@ class CG_OT_correct_current_pose(Operator):
                 f"{total_candidates} within radius; {total_contact} contact; {total_clipping} clipping; corrected {total_corrected}; "
                 f"min distance {global_min_txt}"
             )
-            print("[Cloth Guard][Correct]", msg)
+            log_debug(context, "[Cloth Guard][Correct]", msg)
             self.report({"INFO"}, msg)
 
         return {"FINISHED"}
@@ -1767,8 +1847,8 @@ class CG_OT_clear_live_correction(Operator):
                     for i in range(len(basis.data)):
                         kb.data[i].co = basis.data[i].co
                     cleared += 1
-                except Exception as e:
-                    self.report({"WARNING"}, f"{garment_obj.name}: failed to clear live correction: {e}")
+                except Exception as e:  # per-garment boundary, see _report_garment_error
+                    _report_garment_error(self, context, garment_obj, "clearing the live correction", e)
 
             self.report({"INFO"}, f"Cleared CG_LiveCorrection on {cleared} garment(s) (Basis unchanged)")
         return {"FINISHED"}
@@ -1803,10 +1883,15 @@ class CG_OT_scan_animation(Operator):
         prev_frame = int(scene.frame_current)
         flagged_frames = 0
 
+        frames = list(range(start, end + 1, step))
+        wm = context.window_manager
+        wm.progress_begin(0, len(frames))  # progress counter so Blender does not look frozen
         try:
-            for frame in range(start, end + 1, step):
+            for frame_index, frame in enumerate(frames):
+                wm.progress_update(frame_index)
                 scene.frame_set(frame)
                 depsgraph = context.evaluated_depsgraph_get()
+                body_surface = build_body_surface(body_obj, depsgraph)  # once per frame, shared by every garment
 
                 total_contact = 0
                 total_clipping = 0
@@ -1821,12 +1906,13 @@ class CG_OT_scan_animation(Operator):
                             garment_obj=garment_obj,
                             body_obj=body_obj,
                             depsgraph=depsgraph,
+                            body_surface=body_surface,
                             offset_distance=max(0.0, float(settings.offset_distance + settings.safety_margin)),
                             detection_radius=max(float(settings.offset_distance + settings.safety_margin), settings.detection_radius),
                         )
-                    except Exception as e:
+                    except Exception as e:  # per-garment boundary, see _report_garment_error
                         details_parts.append(f"{garment_obj.name}:ERR")
-                        print("[Cloth Guard][Scan]", garment_obj.name, "ERROR", e)
+                        _report_garment_error(self, context, garment_obj, "scan", e, frame=frame)
                         continue
 
                     s = res.stats
@@ -1843,12 +1929,13 @@ class CG_OT_scan_animation(Operator):
                     item.contact_verts = int(total_contact)
                     item.clipping_verts = int(total_clipping)
                     item.min_distance = float(min_dist) if min_dist is not None else 0.0
-                    item.details = ", ".join(details_parts)[:1024]
+                    item.details = ", ".join(details_parts)[:PROBLEM_FRAME_DETAILS_MAX_CHARS]
                     flagged_frames += 1
 
-                if frame == start or frame == end or (frame - start) % max(step * 10, 1) == 0:
+                if frame == start or frame == end or (frame - start) % max(step * SCAN_LOG_EVERY_STEPS, 1) == 0:
                     min_txt = f"{min_dist:.6f} m" if min_dist is not None else "n/a"
-                    print(
+                    log_debug(
+                        context,
                         "[Cloth Guard][Scan]",
                         f"frame={frame}",
                         f"contact={total_contact}",
@@ -1856,6 +1943,7 @@ class CG_OT_scan_animation(Operator):
                         f"min={min_txt}",
                     )
         finally:
+            wm.progress_end()
             scene.frame_set(prev_frame)
 
         self.report({"INFO"}, f"Scan complete: {flagged_frames} problem frame(s) flagged ({start}-{end} step {step})")
@@ -1939,10 +2027,7 @@ def _keyframe_modifier_factor(*, garment_obj: bpy.types.Object, mod_name: str, f
     if mod is None or not hasattr(mod, "factor"):
         return
     mod.factor = float(value)
-    try:
-        mod.keyframe_insert(data_path="factor", frame=int(frame))
-    except Exception:
-        return
+    mod.keyframe_insert(data_path="factor", frame=int(frame))
 
     ad = garment_obj.animation_data
     if ad is None or ad.action is None:
@@ -1972,6 +2057,7 @@ class CG_OT_generate_correction_current_frame(Operator):
 
         frame = int(context.scene.frame_current)
         depsgraph = context.evaluated_depsgraph_get()
+        body_surface = build_body_surface(body_obj, depsgraph)  # once per frame, shared by every garment
 
         view_layer = context.view_layer
         prev_active = view_layer.objects.active
@@ -1987,6 +2073,7 @@ class CG_OT_generate_correction_current_frame(Operator):
                         garment_obj=garment_obj,
                         body_obj=body_obj,
                         depsgraph=depsgraph,
+                        body_surface=body_surface,
                         offset_distance=target_offset,
                         detection_radius=max(target_offset, settings.detection_radius),
                     )
@@ -2009,6 +2096,7 @@ class CG_OT_generate_correction_current_frame(Operator):
                             garment_obj=garment_obj,
                             body_obj=body_obj,
                             depsgraph=depsgraph,
+                            body_surface=body_surface,
                             det_before=det,
                             target_offset=target_offset,
                         )
@@ -2016,7 +2104,8 @@ class CG_OT_generate_correction_current_frame(Operator):
                         _keyframe_modifier_strength(garment_obj=garment_obj, mod_name=CG_MOD_ANTICLIP, frame=frame, value=float(accepted_factor))
                         _keyframe_modifier_strength(garment_obj=garment_obj, mod_name=CG_MOD_ANTICLIP, frame=frame + 1, value=0.0)
                         baked += 1
-                        print(
+                        log_debug(
+                            context,
                             "[Cloth Guard][BakeFrame][Helper]",
                             garment_obj.name,
                             f"frame={frame}",
@@ -2034,6 +2123,7 @@ class CG_OT_generate_correction_current_frame(Operator):
                         garment_obj=garment_obj,
                         body_obj=body_obj,
                         depsgraph=depsgraph,
+                        body_surface=body_surface,
                         report_to=self,
                     )
                     changed_live, max_live = _shapekey_delta_stats(garment_obj=garment_obj, shapekey_name=CG_SHAPEKEY_LIVE)
@@ -2047,7 +2137,8 @@ class CG_OT_generate_correction_current_frame(Operator):
                     _keyframe_shapekey_value(garment_obj=garment_obj, key_name=key_name, frame=frame, value=1.0)
                     _keyframe_shapekey_value(garment_obj=garment_obj, key_name=key_name, frame=frame + 1, value=0.0)
                     changed, max_d = _shapekey_delta_stats(garment_obj=garment_obj, shapekey_name=key_name)
-                    print(
+                    log_debug(
+                        context,
                         "[Cloth Guard][BakeFrame]",
                         garment_obj.name,
                         f"frame={frame}",
@@ -2059,8 +2150,8 @@ class CG_OT_generate_correction_current_frame(Operator):
                         f"key={key_name}",
                     )
                     baked += 1
-                except Exception as e:
-                    self.report({"WARNING"}, f"{garment_obj.name}: bake failed: {e}")
+                except Exception as e:  # per-garment boundary, see _report_garment_error
+                    _report_garment_error(self, context, garment_obj, "correction bake", e, frame=frame)
             settings.enable_live_anti_clip = True
 
         view_layer.objects.active = prev_active
@@ -2096,11 +2187,15 @@ class CG_OT_generate_corrections_flagged_frames(Operator):
         frames = sorted(set(frames))
 
         baked_keys = 0
+        wm = context.window_manager
+        wm.progress_begin(0, len(frames))  # progress counter so Blender does not look frozen
         try:
             with _temporary_mode_object(context):
-                for frame in frames:
+                for frame_index, frame in enumerate(frames):
+                    wm.progress_update(frame_index)
                     scene.frame_set(frame)
                     depsgraph = context.evaluated_depsgraph_get()
+                    body_surface = build_body_surface(body_obj, depsgraph)  # once per frame, shared by every garment
                     for garment_obj in garments:
                         try:
                             target_offset = max(0.0, float(settings.offset_distance + settings.safety_margin))
@@ -2110,6 +2205,7 @@ class CG_OT_generate_corrections_flagged_frames(Operator):
                                 garment_obj=garment_obj,
                                 body_obj=body_obj,
                                 depsgraph=depsgraph,
+                                body_surface=body_surface,
                                 offset_distance=target_offset,
                                 detection_radius=max(target_offset, settings.detection_radius),
                             )
@@ -2131,6 +2227,7 @@ class CG_OT_generate_corrections_flagged_frames(Operator):
                                     garment_obj=garment_obj,
                                     body_obj=body_obj,
                                     depsgraph=depsgraph,
+                                    body_surface=body_surface,
                                     det_before=det,
                                     target_offset=target_offset,
                                 )
@@ -2138,7 +2235,8 @@ class CG_OT_generate_corrections_flagged_frames(Operator):
                                 _keyframe_modifier_strength(garment_obj=garment_obj, mod_name=CG_MOD_ANTICLIP, frame=frame, value=float(accepted_factor))
                                 _keyframe_modifier_strength(garment_obj=garment_obj, mod_name=CG_MOD_ANTICLIP, frame=frame + 1, value=0.0)
                                 baked_keys += 1
-                                print(
+                                log_debug(
+                                    context,
                                     "[Cloth Guard][BakeFlagged][Helper]",
                                     garment_obj.name,
                                     f"frame={frame}",
@@ -2156,11 +2254,12 @@ class CG_OT_generate_corrections_flagged_frames(Operator):
                                 garment_obj=garment_obj,
                                 body_obj=body_obj,
                                 depsgraph=depsgraph,
+                                body_surface=body_surface,
                                 report_to=self,
                             )
                             changed_live, max_live = _shapekey_delta_stats(garment_obj=garment_obj, shapekey_name=CG_SHAPEKEY_LIVE)
                             if changed_live <= 0 or max_live <= 1e-12:
-                                print("[Cloth Guard][BakeFlagged]", garment_obj.name, f"frame={frame}", "NO_DELTA")
+                                log_debug(context, "[Cloth Guard][BakeFlagged]", garment_obj.name, f"frame={frame}", "NO_DELTA")
                                 continue
                             view_layer.objects.active = garment_obj
                             key_name = f"CG_Frame_{frame:04d}"
@@ -2169,7 +2268,8 @@ class CG_OT_generate_corrections_flagged_frames(Operator):
                             _keyframe_shapekey_value(garment_obj=garment_obj, key_name=key_name, frame=frame, value=1.0)
                             _keyframe_shapekey_value(garment_obj=garment_obj, key_name=key_name, frame=frame + 1, value=0.0)
                             changed, max_d = _shapekey_delta_stats(garment_obj=garment_obj, shapekey_name=key_name)
-                            print(
+                            log_debug(
+                                context,
                                 "[Cloth Guard][BakeFlagged]",
                                 garment_obj.name,
                                 f"frame={frame}",
@@ -2181,10 +2281,11 @@ class CG_OT_generate_corrections_flagged_frames(Operator):
                                 f"key={key_name}",
                             )
                             baked_keys += 1
-                        except Exception as e:
-                            self.report({"WARNING"}, f"{garment_obj.name} @ {frame}: bake failed: {e}")
+                        except Exception as e:  # per-garment boundary, see _report_garment_error
+                            _report_garment_error(self, context, garment_obj, "correction bake", e, frame=frame)
                 settings.enable_live_anti_clip = True
         finally:
+            wm.progress_end()
             scene.frame_set(prev_frame)
             view_layer.objects.active = prev_active
 
@@ -2208,6 +2309,7 @@ class CG_OT_refresh_live_correction(Operator):
 
         with _temporary_mode_object(context):
             depsgraph = context.evaluated_depsgraph_get()
+            body_surface = build_body_surface(body_obj, depsgraph)  # once per frame, shared by every garment
             total_corrected = 0
             global_min = None
             for garment_obj in garments:
@@ -2216,6 +2318,7 @@ class CG_OT_refresh_live_correction(Operator):
                         garment_obj=garment_obj,
                         body_obj=body_obj,
                         depsgraph=depsgraph,
+                        body_surface=body_surface,
                         offset_distance=settings.offset_distance,
                         detection_radius=max(settings.offset_distance, settings.detection_radius),
                         correction_strength=settings.correction_strength,
@@ -2225,8 +2328,8 @@ class CG_OT_refresh_live_correction(Operator):
                         use_risk_area=settings.use_risk_area,
                         preserve_pinned_areas=settings.preserve_pinned_areas,
                     )
-                except Exception as e:
-                    self.report({"WARNING"}, f"{garment_obj.name}: {e}")
+                except Exception as e:  # per-garment boundary, see _report_garment_error
+                    _report_garment_error(self, context, garment_obj, "live correction refresh", e)
                     continue
                 _warn_unconvertible(
                     self, garment_obj, context.scene.frame_current, stats.unconvertible_verts, "anti-clip push"
@@ -2277,12 +2380,14 @@ class CG_OT_create_corrective_shapekey(Operator):
             ensure_live_correction_shapekey(garment_obj)
             settings.enable_live_anti_clip = True
             depsgraph = context.evaluated_depsgraph_get()
+            body_surface = build_body_surface(settings.body_object, depsgraph)  # once per frame, shared by every garment
             det_before, det_after, used = _run_shape_key_passes(
                 context=context,
                 settings=settings,
                 garment_obj=garment_obj,
                 body_obj=settings.body_object,
                 depsgraph=depsgraph,
+                body_surface=body_surface,
                 report_to=self,
             )
             changed_live, max_live = _shapekey_delta_stats(garment_obj=garment_obj, shapekey_name=CG_SHAPEKEY_LIVE)
@@ -2308,8 +2413,8 @@ class CG_OT_create_corrective_shapekey(Operator):
                 from_mix=False,
             )
             bake_live_key_into(garment_obj, CG_SHAPEKEY_LIVE, new_key.name)
-        except Exception as e:
-            self.report({"ERROR"}, f"Failed to bake corrective shape key: {e}")
+        except Exception as e:  # shape-key creation on this garment; reported, never silent
+            _report_garment_error(self, context, garment_obj, "baking the corrective shape key", e, level="ERROR")
             return {"CANCELLED"}
         finally:
             view_layer.objects.active = prev_active
@@ -2336,10 +2441,10 @@ class CG_OT_create_corrective_shapekey(Operator):
                     min_angle_rad=float(settings.driver_min_angle),
                     max_angle_rad=float(settings.driver_max_angle),
                 )
-            except Exception as e:
-                self.report({"WARNING"}, f"Corrective created, but driver linking failed: {e}")
+            except Exception as e:  # driver API on user data; the key itself was created
+                _report_garment_error(self, context, garment_obj, "linking the corrective driver", e)
 
-        print("[Cloth Guard][Corrective]", garment_obj.name, f"frame={context.scene.frame_current}", f"key={new_key.name}", f"delta_verts={changed}", f"max_delta={max_d:.6f}")
+        log_debug(context, "[Cloth Guard][Corrective]", garment_obj.name, f"frame={context.scene.frame_current}", f"key={new_key.name}", f"delta_verts={changed}", f"max_delta={max_d:.6f}")
         return {"FINISHED"}
 
 
