@@ -45,6 +45,7 @@ EXPECTED_OPERATORS = (
     "correct_current_pose",
     "create_body_mask",
     "create_corrective_shapekey",
+    "create_coverage_mask",
     "delete_body_mask",
     "detect_clipping",
     "detect_self_clipping",

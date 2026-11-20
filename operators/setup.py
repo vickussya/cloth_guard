@@ -29,7 +29,7 @@ from ..constants import (
 from ..core.mesh_utils import clear_vertex_group, ensure_vertex_group, is_mesh_object
 from ..core.modifiers import ensure_body_mask_modifier
 from ..core.shape_keys import ensure_live_correction_shapekey
-from ._common import _settings, _temporary_mode_object, _validate_assigned_meshes
+from ._common import _settings, _temporary_mode_object, _validate_assigned_meshes, _warn_if_unusual_scale
 
 
 class CG_OT_setup(Operator):
@@ -54,6 +54,7 @@ class CG_OT_setup(Operator):
             self.report({"ERROR"}, "Assign a valid Body mesh and add garment mesh objects to the Garments list first")
             return {"CANCELLED"}
         body_obj, garments = validated
+        _warn_if_unusual_scale(self, settings, body_obj, context.evaluated_depsgraph_get())
 
         with _temporary_mode_object(context):
             ensure_vertex_group(body_obj, CG_VG_BODY_MASK)
@@ -122,7 +123,10 @@ class CG_OT_remove_setup(Operator):
 class CG_OT_create_body_mask(Operator):
     bl_idname = "cloth_guard.create_body_mask"
     bl_label = "Create Body Mask"
-    bl_description = "Hides body areas under the garment to remove small remaining intersections"
+    bl_description = (
+        "Current frame only: hides body vertices within Mask Distance of the garments on this frame. "
+        "For an animation use Create Coverage Mask (Animation), which keeps skin that shows on any frame visible"
+    )
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):

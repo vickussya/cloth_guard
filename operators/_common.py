@@ -24,11 +24,11 @@ from contextlib import contextmanager
 import bpy
 from bpy.types import Operator
 
-from ..constants import CG_VG_CLIPPING, CG_VG_CONTACT
+from ..constants import BODY_SIZE_MAX, BODY_SIZE_MIN, CG_VG_CLIPPING, CG_VG_CONTACT
 from ..core.body import BodySurface
 from ..core.debug import log_debug
 from ..core.detection import detect_clipping
-from ..core.mesh_utils import is_mesh_object, write_weights_to_vertex_group
+from ..core.mesh_utils import evaluated_world_size, is_mesh_object, write_weights_to_vertex_group
 
 
 # NOTE: Keep operator ids under the `cloth_guard.*` namespace (AGENTS.md).
@@ -167,6 +167,29 @@ def _run_detection_and_weights(
 
 def _topology_mismatch(*, garment_obj: bpy.types.Object, depsgraph) -> bool:
     return _base_vertex_count(garment_obj) != _eval_vertex_count(garment_obj, depsgraph)
+
+
+def _warn_if_unusual_scale(op: Operator, settings, body_obj: bpy.types.Object, depsgraph) -> bool:
+    """
+    Warn when the body is not a real-size character (all Cloth Guard distances are in metres).
+
+    Example: a Mixamo import at 36 m makes the 5 mm offset about 20x too small, so nothing gets
+    corrected. Only warns: rescaling the rig and its animation is the artist's decision.
+    Returns True when it warned.
+    """
+    size = evaluated_world_size(body_obj, depsgraph)
+    if BODY_SIZE_MIN <= size <= BODY_SIZE_MAX:
+        return False
+    op.report(
+        {"WARNING"},
+        f"Body '{body_obj.name}' is {size:.2f} m tall (largest dimension). Cloth Guard distances are in metres "
+        f"and tuned for real-size characters ({BODY_SIZE_MIN:g}-{BODY_SIZE_MAX:g} m): offset "
+        f"{settings.offset_distance * 1000:.0f} mm, detection radius {settings.detection_radius * 100:.1f} cm, "
+        f"max push {settings.max_push_distance * 100:.1f} cm. Fix: select the rig and meshes, Object > Apply > "
+        "Scale (Ctrl+A). If the rig has location keyframes, scale those keyframes by the same factor too. "
+        "Cloth Guard does not rescale anything itself.",
+    )
+    return True
 
 
 def _report_garment_error(

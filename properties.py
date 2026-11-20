@@ -382,6 +382,63 @@ class CG_Settings(PropertyGroup):
         unit="LENGTH",
     )
 
+    # Coverage mask (animation). The frame range is the Scan Animation range (Start / End Frame).
+    coverage_frame_step: IntProperty(
+        name="Coverage Frame Step",
+        description=(
+            "Check every Nth frame of the Start-End range (the last frame is always checked). "
+            "1 is safest: a skipped frame may be the one where skin shows, so larger steps can hide more"
+        ),
+        default=1,
+        min=1,
+    )
+
+    coverage_outward_distance: FloatProperty(
+        name="Cover Distance",
+        description="A garment this close OVER the skin (along the skin normal) counts as covering it",
+        default=0.04,
+        min=0.0,
+        soft_max=0.2,
+        subtype="DISTANCE",
+        unit="LENGTH",
+    )
+
+    coverage_inward_distance: FloatProperty(
+        name="Poke-Through Depth",
+        description="A garment this far UNDER the skin counts as covering it (the body pokes through the garment there)",
+        default=0.06,
+        min=0.0,
+        soft_max=0.2,
+        subtype="DISTANCE",
+        unit="LENGTH",
+    )
+
+    coverage_mode: EnumProperty(
+        name="Coverage Mode",
+        description="Which body vertices to hide",
+        items=(
+            (
+                "ALL_FRAMES",
+                "Covered On All Frames",
+                "Hide skin only if a garment covers it on every checked frame (recommended: "
+                "skin that is visible even once, like a hand touching the coat, stays visible)",
+            ),
+            (
+                "ANY_FRAME",
+                "Covered On Any Frame",
+                "Hide skin covered on at least one frame. WARNING: can hide skin that is visible "
+                "on other frames (hands, face near the collar)",
+            ),
+        ),
+        default="ALL_FRAMES",
+    )
+
+    coverage_protect_group: StringProperty(
+        name="Protect Group",
+        description="Optional body vertex group that is never hidden (e.g. face, hands)",
+        default="",
+    )
+
     use_risk_area: BoolProperty(
         name="Use Risk Area",
         description="If the garment has a 'CG_RiskArea' vertex group, restrict correction/detection to that area",

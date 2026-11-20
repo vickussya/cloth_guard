@@ -72,6 +72,27 @@ Steps:
 5. If small intersections remain under the garment, click **Create Body Mask**.
 6. If you need to remove it later, click **Delete Body Mask**.
 
+## Hiding the body under tight clothes
+
+**Push-out correction** (Generate Correction) moves garment vertices out of the body. It works well for loose clothes and for real penetrations of the garment's vertices.
+
+On **tight clothes** (pants, leggings, sleeves) it cannot fix everything: the body mesh is often much denser than the garment, so the skin pokes through the garment's faces *between* garment vertices, while the garment vertices themselves are already outside. Moving garment vertices does not help there. Hiding the skin under the garment does, and it is standard practice in games and animation.
+
+Use **Create Coverage Mask (Animation)** for that:
+
+1. Set **Start Frame** and **End Frame** (the same range as Scan Animation).
+2. Keep **Coverage Mode** on **Covered On All Frames** (recommended).
+3. Optional: pick a **Protect Group** (a body vertex group for the face and hands) that is never hidden.
+4. Click **Create Coverage Mask (Animation)**.
+
+On every checked frame, Cloth Guard casts a short ray from each body vertex outward (is a garment over the skin?) and inward (does the skin poke through the garment?). A vertex is hidden only if it is covered on **every** checked frame, so skin that shows even once (a hand resting on the coat, the jaw near the collar) stays visible. **Covered On Any Frame** hides more, but can hide skin that is visible on other frames.
+
+- **Coverage Mask**: for a whole animation. Recommended.
+- **Create Body Mask**: hides skin near the garment **on the current frame only**. Fine for a still pose.
+- Both write the same `CG_BodyMask` group, so **Delete Body Mask** removes either.
+
+Tip: if nothing seems to get corrected or masked, check the character's size. Cloth Guard distances are in metres; Setup warns when the body is not between about 0.3 and 3 m (for example a 36 m Mixamo import).
+
 ## Self-Clipping workflow (advanced)
 
 Use this when the garment clips into itself (for example sleeve into torso, collar into shoulder, coat panels intersecting).
@@ -115,7 +136,8 @@ Tip: test on a short range first (for example **1–30**) before running batch o
 - **Generate Corrections (All Flagged Frames)**: creates non-destructive anti-clipping corrections across flagged frames.
 - **Detect Self-Clipping**: experimental; finds areas where the garment intersects itself.
 - **Select Self-Clipping**: selects the detected self-clipping vertices.
-- **Create Body Mask**: hides body areas under the garment to remove small remaining intersections.
+- **Create Coverage Mask (Animation)**: hides body skin that the garments cover on every frame of the range (tight clothes, whole shot).
+- **Create Body Mask**: hides body areas near the garment on the current frame only.
 - **Delete Body Mask**: removes the Cloth Guard body mask and restores hidden body areas.
 - **Clear Live Correction**: resets `CG_LiveCorrection` to match Basis (removes the live anti-clip effect).
 

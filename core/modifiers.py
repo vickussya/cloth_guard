@@ -49,6 +49,11 @@ def ensure_body_mask_modifier(body_obj: bpy.types.Object) -> bpy.types.MaskModif
         mod = body_obj.modifiers.new(name=CG_MOD_BODY_MASK, type="MASK")
     mod.vertex_group = CG_VG_BODY_MASK
     mod.invert_vertex_group = True
+    # The mask must come after the Armature, so it hides vertices of the posed body.
+    last_armature = max((i for i, m in enumerate(body_obj.modifiers) if m.type == "ARMATURE"), default=-1)
+    index = body_obj.modifiers.find(mod.name)
+    if index < last_armature:
+        body_obj.modifiers.move(index, last_armature)
     return mod
 
 

@@ -228,3 +228,22 @@ def _neighbor_rings(adjacency: list[list[int]], start: int, rings: int) -> set[i
         if not frontier:
             break
     return visited
+
+
+def evaluated_world_size(obj: bpy.types.Object, depsgraph) -> float:
+    """
+    Largest side (metres) of the evaluated object's world-space bounding box.
+
+    Used as "how tall is the character": the largest side also works for a character that is
+    lying down or in a wide T-pose. Includes object scale, parent scale and the rig.
+    """
+    obj_eval = obj.evaluated_get(depsgraph)
+    mesh = obj_eval.to_mesh()
+    try:
+        if len(mesh.vertices) == 0:
+            return 0.0
+        mw = obj_eval.matrix_world
+        points = [mw @ v.co for v in mesh.vertices]
+        return max(max(p[axis] for p in points) - min(p[axis] for p in points) for axis in range(3))
+    finally:
+        obj_eval.to_mesh_clear()

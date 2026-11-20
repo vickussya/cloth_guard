@@ -186,6 +186,17 @@ class CG_PT_main(Panel):
 
         box = layout.box()
         box.label(text="Body Mask")
+        box.label(text="Animation: Coverage Mask. One frame only: Body Mask.", icon="INFO")
+        box.operator("cloth_guard.create_coverage_mask", text="Create Coverage Mask (Animation)")
+        col = box.column(align=True)
+        col.prop(settings, "coverage_mode", text="")
+        col.prop(settings, "coverage_frame_step")
+        col.prop(settings, "coverage_outward_distance")
+        col.prop(settings, "coverage_inward_distance")
+        if settings.body_object is not None:
+            col.prop_search(settings, "coverage_protect_group", settings.body_object, "vertex_groups")
+        else:
+            col.prop(settings, "coverage_protect_group")
         row = box.row(align=True)
         row.operator("cloth_guard.create_body_mask", text="Create Body Mask")
         row.operator("cloth_guard.delete_body_mask", text="Delete Body Mask")

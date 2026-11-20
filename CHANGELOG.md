@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Added **Create Coverage Mask (Animation)**: hides body skin that the garments cover on every frame of the Start-End range (ray casts outward and inward from the skin), for skin poking through tight clothes between garment vertices. Skin visible on any checked frame stays visible; optional protect group; "Covered On Any Frame" mode with a warning tooltip.
+- Create Body Mask now says it works on the current frame only; the `CG_BodyMask` modifier is placed after the Armature.
+- Setup and Check Garment Compatibility warn when the body is not real size (about 0.3-3 m), e.g. a 36 m Mixamo import, and explain how to apply scale (nothing is rescaled automatically).
+
 ## 0.1.1 (2026-11-20)
 
 - Added a clear post-animation workflow (scan frames, list problem frames, jump to frames, batch generate fixes).

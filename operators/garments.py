@@ -30,6 +30,7 @@ from ._common import (
     _settings,
     _temporary_mode_object,
     _validate_assigned_meshes,
+    _warn_if_unusual_scale,
 )
 
 
@@ -56,10 +57,11 @@ class CG_OT_check_garment_compatibility(Operator):
         if validated is None:
             self.report({"ERROR"}, "Assign a valid Body mesh and add garment mesh objects to the Garments list first")
             return {"CANCELLED"}
-        _, garments = validated
+        body_obj, garments = validated
 
         with _temporary_mode_object(context):
             depsgraph = context.evaluated_depsgraph_get()
+            _warn_if_unusual_scale(self, settings, body_obj, depsgraph)
             bad = 0
             lines = []
             for garment_obj in garments:

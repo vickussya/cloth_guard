@@ -49,6 +49,7 @@ from .garments import (
     CG_OT_move_garment,
     CG_OT_remove_active_garment,
 )
+from .masking import CG_OT_create_coverage_mask
 from .setup import CG_OT_create_body_mask, CG_OT_delete_body_mask, CG_OT_remove_setup, CG_OT_setup
 from .shape_preservation import (
     CG_OT_analyze_shape_drift,
@@ -66,6 +67,7 @@ CLASSES = (
     CG_OT_remove_setup,
     CG_OT_create_body_mask,
     CG_OT_delete_body_mask,
+    CG_OT_create_coverage_mask,
     CG_OT_store_rest_shape,
     CG_OT_analyze_shape_drift,
     CG_OT_generate_shape_preservation_current,

@@ -104,3 +104,10 @@ HELPER_VERIFY_ATTEMPTS = 5  # tries for the Geometry Nodes helper before it is s
 RETRY_STRENGTH_FACTOR = 0.5  # every rejected try halves the strength
 SCAN_LOG_EVERY_STEPS = 10  # Scan Animation prints a debug line every 10 frame steps
 PROBLEM_FRAME_DETAILS_MAX_CHARS = 1024  # same as maxlen of CG_ProblemFrameItem.details
+
+# Coverage mask (hide body skin that a garment covers on every sampled frame)
+COVERAGE_RAY_START_OFFSET = 1e-4  # rays start 0.1 mm off the skin so they never hit a garment exactly at the vertex
+
+# Scale check: Cloth Guard distances are in metres and tuned for real-size characters
+BODY_SIZE_MIN = 0.3  # smaller than this (largest body dimension, metres) triggers the scale warning
+BODY_SIZE_MAX = 3.0  # larger than this triggers the scale warning (e.g. a Mixamo import at 36 m)
