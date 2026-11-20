@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from typing import Iterable, Optional
 
 import bpy
-from mathutils import Vector
+from mathutils import Matrix, Vector
 from mathutils.bvhtree import BVHTree
 
 CG_VG_BODY_MASK = "CG_BodyMask"
@@ -106,7 +106,7 @@ class ClipDetectionStats:
     flagged_clipping: int
     min_nearest_distance: float | None
     avg_flagged_distance: float | None
-    max_penetration: float | None
+    max_penetration: float | None  # deepest flagged vertex below the body surface, in meters
 
 
 @dataclass(frozen=True)
@@ -139,6 +139,30 @@ def _boundary_vertex_mask(mesh: bpy.types.Mesh) -> list[bool]:
             boundary[a] = True
             boundary[b] = True
     return boundary
+
+
+def _signed_volume(verts: list[Vector], tris: list[tuple[int, int, int]]) -> float:
+    """
+    Signed volume of a triangle mesh (sum of the tetrahedra from the origin to every triangle).
+
+    Positive when the face normals point outward, negative when the mesh is inside-out.
+    Small holes (neck, wrists) barely change the result, so the sign stays reliable for bodies.
+    """
+    total = 0.0
+    for a, b, c in tris:
+        total += verts[a].dot(verts[b].cross(verts[c]))
+    return total / 6.0
+
+
+def _body_normal_sign(verts: list[Vector], tris: list[tuple[int, int, int]]) -> float:
+    """
+    +1.0 if the body's face normals point outward, -1.0 if the body is inside-out (flipped normals).
+
+    Multiply every BVH normal by this so that "positive = outside" holds for both cases.
+    (Comparing distances a small step along +n / -n cannot do this: for a point INSIDE the
+    body, stepping inward also increases the distance, so it would pick the inward side.)
+    """
+    return 1.0 if _signed_volume(verts, tris) >= 0.0 else -1.0
 
 
 def _safe_min(values: Iterable[float | None]) -> float | None:
@@ -181,6 +205,132 @@ def ensure_live_preserve_shapekey(garment_obj: bpy.types.Object) -> bpy.types.Sh
     if kb is None:
         kb = garment_obj.shape_key_add(name=CG_SHAPEKEY_LIVE_PRESERVE, from_mix=False)
     return kb
+
+
+def shape_key_offsets(kb: bpy.types.ShapeKey, basis: bpy.types.ShapeKey) -> list[Vector]:
+    """
+    Per vertex: what this shape key currently adds on top of Basis (offset x value).
+    A muted key adds nothing.
+    """
+    factor = 0.0 if kb.mute else float(kb.value)
+    return [(kb.data[i].co - basis.data[i].co) * factor for i in range(len(basis.data))]
+
+
+def reset_shape_key_to_basis(kb: bpy.types.ShapeKey, basis: bpy.types.ShapeKey) -> None:
+    for i in range(len(basis.data)):
+        kb.data[i].co = basis.data[i].co
+
+
+def bake_live_key_into(garment_obj: bpy.types.Object, live_name: str, target_name: str) -> bpy.types.ShapeKey:
+    """
+    Move a live correction key (CG_LiveCorrection / CG_LivePreserve) into a per-frame key.
+
+    New target = what the target key already adds + what the live key adds. The live key is then
+    reset to Basis, so the correction is counted once (in the target key), not twice.
+    Only the live key's own offset is copied: the user's other shape keys are not baked in.
+    """
+    keys = _ensure_shape_keys(garment_obj)
+    basis = keys.key_blocks[0]
+    live = keys.key_blocks.get(live_name)
+    if live is None:
+        raise RuntimeError(f"{live_name} shape key is missing")
+
+    live_offsets = shape_key_offsets(live, basis)
+    target = keys.key_blocks.get(target_name)
+    if target is None:
+        target = garment_obj.shape_key_add(name=target_name, from_mix=False)
+        target_offsets = [Vector((0.0, 0.0, 0.0))] * len(basis.data)
+    else:
+        target_offsets = shape_key_offsets(target, basis)
+
+    for i in range(len(basis.data)):
+        target.data[i].co = basis.data[i].co + target_offsets[i] + live_offsets[i]
+    reset_shape_key_to_basis(live, basis)
+    return target
+
+
+# Temporary shape key used to measure how the modifiers move the garment (always removed again).
+CG_SHAPEKEY_PROBE = "CG__DeformProbe"
+# Probe step as a fraction of the garment's rest bounding-box diagonal (0.1%). Small enough that
+# non-linear modifiers (Corrective Smooth, Shrinkwrap) still respond linearly, large enough to stay
+# far above float32 rounding of the evaluated positions (~7 significant digits).
+DEFORM_PROBE_STEP_FRACTION = 1e-3
+# Matrices this close to "flat" (determinant = how much a tiny cube's volume changes) cannot be undone.
+DEFORM_MIN_DETERMINANT = 1e-6
+# If undoing the deformation would make the push more than this many times longer, don't trust it.
+DEFORM_MAX_AMPLIFICATION = 10.0
+
+
+def _evaluated_local_coords(obj: bpy.types.Object, depsgraph) -> list[Vector]:
+    obj_eval = obj.evaluated_get(depsgraph)
+    mesh = obj_eval.to_mesh()
+    try:
+        return [v.co.copy() for v in mesh.vertices]
+    finally:
+        obj_eval.to_mesh_clear()
+
+
+def rest_space_deformation(garment_obj: bpy.types.Object, depsgraph) -> list[Matrix] | None:
+    """
+    Per vertex: a 3x3 matrix J with   posed offset = J @ shape-key offset.
+
+    Shape keys are applied before the Armature (and other deforming modifiers), so J says what the
+    rig does to a small move written into a shape key. It is measured, not computed from bones:
+    a temporary probe key moves every vertex one small step along X, then Y, then Z, and we read
+    where the evaluated vertex ends up. Works for any modifier stack that keeps the vertex count.
+
+    Returns None when no modifier is enabled (then J is the identity: nothing to convert).
+    """
+    if not any(m.show_viewport for m in garment_obj.modifiers):
+        return None
+
+    keys = _ensure_shape_keys(garment_obj)
+    basis = keys.key_blocks[0]
+    lo = Vector((min(p.co.x for p in basis.data), min(p.co.y for p in basis.data), min(p.co.z for p in basis.data)))
+    hi = Vector((max(p.co.x for p in basis.data), max(p.co.y for p in basis.data), max(p.co.z for p in basis.data)))
+    step = max(1e-6, (hi - lo).length * DEFORM_PROBE_STEP_FRACTION)
+
+    base = _evaluated_local_coords(garment_obj, depsgraph)
+    probe = garment_obj.shape_key_add(name=CG_SHAPEKEY_PROBE, from_mix=False)
+    probe.value = 1.0
+    columns = []
+    try:
+        for axis in (Vector((step, 0.0, 0.0)), Vector((0.0, step, 0.0)), Vector((0.0, 0.0, step))):
+            for i, point in enumerate(probe.data):
+                point.co = basis.data[i].co + axis
+            depsgraph.update()
+            moved = _evaluated_local_coords(garment_obj, depsgraph)
+            columns.append([(moved[i] - base[i]) / step for i in range(len(base))])
+    finally:
+        garment_obj.shape_key_remove(probe)
+        depsgraph.update()
+
+    return [Matrix((columns[0][i], columns[1][i], columns[2][i])).transposed() for i in range(len(base))]
+
+
+def to_rest_space(deltas: list[Vector], deformation: list[Matrix] | None) -> tuple[list[Vector], int]:
+    """
+    Undo the deformation on posed-space pushes: rest push = J^-1 @ posed push.
+
+    Returns (converted pushes, unconvertible count). A vertex whose J is flat or would blow the push
+    up by more than DEFORM_MAX_AMPLIFICATION keeps its posed push (the old behaviour) and is counted,
+    so the operator can warn the artist.
+    """
+    if deformation is None:
+        return deltas, 0
+    out: list[Vector] = []
+    unconvertible = 0
+    for d, j in zip(deltas, deformation):
+        if d.length_squared == 0.0:
+            out.append(d)
+            continue
+        rest = j.inverted_safe() @ d if abs(j.determinant()) >= DEFORM_MIN_DETERMINANT else None
+        if rest is None or rest.length > d.length * DEFORM_MAX_AMPLIFICATION:
+            out.append(d)
+            unconvertible += 1
+        else:
+            out.append(rest)
+    return out, unconvertible
 
 
 def _build_vertex_adjacency(mesh: bpy.types.Mesh) -> list[list[int]]:
@@ -317,6 +467,7 @@ def detect_clipping(
         body_verts = [v.co.copy() for v in body_mesh.vertices]
         body_tris = [tuple(lt.vertices) for lt in body_mesh.loop_triangles]
         bvh_body = BVHTree.FromPolygons(body_verts, body_tris, all_triangles=True, epsilon=0.0)
+        body_normal_sign = _body_normal_sign(body_verts, body_tris)
         risk_idx = _vertex_group_index(garment_obj, CG_VG_RISK) if use_risk_area else None
 
         collar_idx = _vertex_group_index(garment_obj, CG_VG_PRESERVE_COLLAR)
@@ -337,6 +488,8 @@ def detect_clipping(
         contact_weights: list[float] = [0.0] * base_vert_count
         clipping_weights: list[float] = [0.0] * base_vert_count
         nearest_distances: list[float | None] = [None] * base_vert_count
+        # Positive = outside the body, negative = inside (None = no normal / not a candidate).
+        signed_distances: list[float | None] = [None] * base_vert_count
 
         checked = 0
         candidates = 0
@@ -357,16 +510,26 @@ def detect_clipping(
                 continue
 
             nearest_co, nearest_no, _, dist = nearest
+            if nearest_no is not None:
+                nearest_no = nearest_no * body_normal_sign  # make it point out of the body
             if dist is None:
                 dist = (garment_in_body - nearest_co).length
             dist = float(dist)
             nearest_distances[i] = dist
 
-            if dist <= detection_radius:
+            # A vertex deep inside the body is also "far" from the surface, so the unsigned
+            # distance alone must not drop it from detection.
+            deep_inside = (
+                dist > detection_radius
+                and nearest_no is not None
+                and float((garment_in_body - nearest_co).dot(nearest_no)) < -penetration_eps
+            )
+
+            if dist <= detection_radius or deep_inside:
                 candidates += 1
                 if detection_radius == offset_distance:
                     contact_w = 1.0
-                elif dist <= offset_distance:
+                elif dist <= offset_distance or deep_inside:
                     contact_w = 1.0
                 else:
                     contact_w = (detection_radius - dist) / (detection_radius - offset_distance)
@@ -376,6 +539,7 @@ def detect_clipping(
                 if nearest_no is not None:
                     vec = garment_in_body - nearest_co
                     signed = float(vec.dot(nearest_no))
+                    signed_distances[i] = signed
                     if signed < -penetration_eps:
                         # Depth-based weight (0..1 over ~offset_distance of penetration).
                         denom = max(1e-8, offset_distance)
@@ -448,7 +612,7 @@ def detect_clipping(
                 penetrates = False
                 if nearest_no is not None:
                     vec = centroid - nearest_co
-                    if float(vec.dot(nearest_no)) < -penetration_eps:
+                    if float(vec.dot(nearest_no * body_normal_sign)) < -penetration_eps:
                         penetrates = True
                 if not penetrates and dist <= (offset_distance * 0.15):
                     penetrates = True
@@ -470,15 +634,14 @@ def detect_clipping(
         flagged_contact = sum(1 for w in contact_weights if w > 0.0)
         flagged_clipping = sum(1 for w in clipping_weights if w > 0.0)
         flagged_dists = [d for i, d in enumerate(nearest_distances) if d is not None and clipping_weights[i] > 0.0]
+        # True depth below the body surface. (offset_distance - dist was "how far inside the
+        # offset zone": it reported 0 for any vertex deeper than offset_distance.)
         max_pen = None
-        try:
-            for i, d in enumerate(nearest_distances):
-                if d is None or clipping_weights[i] <= 0.0:
-                    continue
-                pen = max(0.0, float(offset_distance) - float(d))
-                max_pen = pen if max_pen is None else max(max_pen, pen)
-        except Exception:
-            max_pen = None
+        for i, s in enumerate(signed_distances):
+            if s is None or clipping_weights[i] <= 0.0:
+                continue
+            pen = max(0.0, -s)
+            max_pen = pen if max_pen is None else max(max_pen, pen)
         stats = ClipDetectionStats(
             checked_verts=checked,
             candidates_within_radius=candidates,
@@ -506,6 +669,8 @@ class PoseCorrectionStats:
     min_nearest_distance: float | None
     changed_verts: int
     max_delta_distance: float
+    # Pushed vertices whose deformation could not be undone (see to_rest_space); they keep the posed push.
+    unconvertible_verts: int = 0
 
 
 def correct_current_pose(
@@ -521,7 +686,6 @@ def correct_current_pose(
     smooth_strength: float,
     use_risk_area: bool,
     preserve_pinned_areas: bool,
-    accumulate: bool = False,
 ) -> PoseCorrectionStats:
     offset_distance = max(0.0, float(offset_distance))
     detection_radius = max(offset_distance, float(detection_radius))
@@ -570,15 +734,19 @@ def correct_current_pose(
         corrected = 0
         nearest_distances: list[float | None] = [None] * len(garment_mesh.vertices)
 
-        def _choose_outward_normal(point_body: Vector, normal_body: Vector) -> Vector:
-            n = normal_body.normalized()
-            # Pick the direction that increases distance from body most (handles flipped normals).
-            test_step = max(1e-6, offset_distance * 0.25)
-            d_pos = bvh_body.find_nearest(point_body + n * test_step)
-            d_neg = bvh_body.find_nearest(point_body - n * test_step)
-            dist_pos = float(d_pos[3]) if d_pos is not None and d_pos[3] is not None else 0.0
-            dist_neg = float(d_neg[3]) if d_neg is not None and d_neg[3] is not None else 0.0
-            return n if dist_pos >= dist_neg else (-n)
+        body_normal_sign = _body_normal_sign(body_verts, body_tris)
+
+        def _choose_outward_normal(normal_body: Vector) -> Vector:
+            return normal_body.normalized() * body_normal_sign
+
+        def _signed_distance(point_body: Vector, nearest_co: Vector, nearest_no: Vector | None) -> float:
+            # Positive = outside the body, negative = inside.
+            # Without a surface normal the side is unknown, so we assume "outside" and return the
+            # plain distance: such a vertex only gets the gentle near-contact push, never a deep push.
+            vec = point_body - nearest_co
+            if nearest_no is None:
+                return float(vec.length)
+            return float(vec.dot(_choose_outward_normal(nearest_no)))
 
         for i, v in enumerate(garment_mesh.vertices):
             if risk_idx is not None and _vertex_weight(base_mesh.vertices[i], risk_idx) <= 0.0:
@@ -595,18 +763,18 @@ def correct_current_pose(
             dist = float(dist)
             nearest_distances[i] = dist
 
-            if dist > detection_radius and dist > offset_distance:
+            signed = _signed_distance(garment_in_body, nearest_co, nearest_no)
+            inside = signed < -penetration_eps
+
+            # Skip vertices that are far away AND outside. A vertex deep inside the body is also
+            # "far" from the surface, so the unsigned distance alone must not skip it.
+            if dist > detection_radius and not inside:
                 continue
 
-            vec = garment_in_body - nearest_co
             if nearest_no is not None:
-                outward_no = _choose_outward_normal(garment_in_body, nearest_no)
-                signed = float(vec.dot(outward_no))
-                inside = signed < -penetration_eps
-                push_dir_body = outward_no
+                push_dir_body = _choose_outward_normal(nearest_no)
             else:
-                signed = float(vec.length)
-                inside = False
+                vec = garment_in_body - nearest_co
                 push_dir_body = vec.normalized() if vec.length > 1e-12 else Vector((0.0, 0.0, 1.0))
 
             if inside:
@@ -650,22 +818,15 @@ def correct_current_pose(
             if scale <= 0.0:
                 continue
 
-            # Per-vertex safety: only keep the move if it increases distance from the body.
+            # Per-vertex safety: only keep the move if the vertex ends up further OUTSIDE the body.
             push_dir_body_n = push_dir_body.normalized()
             delta_body = push_dir_body_n * (push_amount * scale)
-            dist_after = None
-            try:
-                n2 = bvh_body.find_nearest(garment_in_body + delta_body)
-                if n2 is not None and n2[3] is not None:
-                    dist_after = float(n2[3])
-                elif n2 is not None:
-                    dist_after = float((garment_in_body + delta_body - n2[0]).length)
-            except Exception:
-                dist_after = None
-
-            # If distance does not improve, reject this vertex move.
-            if dist_after is not None and dist_after <= dist + 1e-8:
-                continue
+            new_pos = garment_in_body + delta_body
+            n2 = bvh_body.find_nearest(new_pos)
+            if n2 is not None:
+                signed_after = _signed_distance(new_pos, n2[0], n2[1])
+                if signed_after <= signed + 1e-8:
+                    continue
 
             push_dir_world = (body_mw.to_3x3() @ push_dir_body_n).normalized()
             world_delta = push_dir_world * (push_amount * scale)
@@ -691,24 +852,33 @@ def correct_current_pose(
                 changed += 1
                 wd = mw3 @ d
                 max_delta = max(max_delta, float(wd.length))
-
-        live = ensure_live_correction_shapekey(garment_obj)
-        basis = garment_obj.data.shape_keys.key_blocks[0]
-        base_kb = live if accumulate else basis
-        for i in range(len(base_mesh.vertices)):
-            live.data[i].co = base_kb.data[i].co + deltas[i]
-        live.value = 1.0
-
-        return PoseCorrectionStats(
-            checked_verts=checked,
-            corrected_verts=corrected,
-            min_nearest_distance=_safe_min(nearest_distances),
-            changed_verts=changed,
-            max_delta_distance=max_delta,
-        )
     finally:
+        # Free the evaluated meshes before probing below (probing re-evaluates the scene).
         body_eval.to_mesh_clear()
         garment_eval.to_mesh_clear()
+
+    # The pushes were measured on the posed garment, but a shape key is applied BEFORE the
+    # Armature (and other deforming modifiers). Convert them back so they still point outward
+    # after the rig re-poses them.
+    deltas, unconvertible = to_rest_space(deltas, rest_space_deformation(garment_obj, depsgraph))
+
+    live = ensure_live_correction_shapekey(garment_obj)
+    basis = garment_obj.data.shape_keys.key_blocks[0]
+    # The pose we measured already contains the live key at its current value,
+    # so the new push goes on top of that (not on top of Basis, which would drop it).
+    already_applied = shape_key_offsets(live, basis)
+    for i in range(len(basis.data)):
+        live.data[i].co = basis.data[i].co + already_applied[i] + deltas[i]
+    live.value = 1.0
+
+    return PoseCorrectionStats(
+        checked_verts=checked,
+        corrected_verts=corrected,
+        min_nearest_distance=_safe_min(nearest_distances),
+        changed_verts=changed,
+        max_delta_distance=max_delta,
+        unconvertible_verts=unconvertible,
+    )
 
 
 def compute_proximity_weights(
@@ -944,10 +1114,10 @@ def generate_shape_preservation(
     protect_borders: bool,
     protect_groups: bool,
     cage_eval_obj: bpy.types.Object | None = None,
-) -> tuple[int, float]:
+) -> tuple[int, float, int]:
     """
     Generate/update CG_LivePreserve to reduce high-frequency drift compared to CG_RestShape.
-    Returns (changed_verts, max_delta_world_m).
+    Returns (changed_verts, max_delta_world_m, unconvertible_verts).
     """
     if garment_obj.type != "MESH":
         raise RuntimeError("Garment is not a mesh")
@@ -968,7 +1138,9 @@ def generate_shape_preservation(
     obj_eval = cage_eval_obj if cage_eval_obj is not None else garment_obj.evaluated_get(depsgraph)
     mesh_eval = obj_eval.to_mesh()
     try:
-        mesh_eval.calc_normals()
+        # Blender 4.1 removed Mesh.calc_normals(); since then normals are always up to date.
+        if bpy.app.version < (4, 1, 0):
+            mesh_eval.calc_normals()
         base_mesh = garment_obj.data
         if len(mesh_eval.vertices) != len(base_mesh.vertices) or len(rest.data) != len(base_mesh.vertices):
             raise RuntimeError("Shape preservation requires a topology-stable cage evaluation")
@@ -997,12 +1169,10 @@ def generate_shape_preservation(
         seams_idx = _vertex_group_index(garment_obj, CG_VG_PRESERVE_SEAMS) if protect_groups else None
         preserve_scale = 0.75
 
-        live = ensure_live_preserve_shapekey(garment_obj)
-        basis = garment_obj.data.shape_keys.key_blocks[0]
-
         changed = 0
         max_delta_world = 0.0
         mw3 = garment_obj.matrix_world.to_3x3()
+        corrections: list[Vector] = []
 
         for i in range(len(base_mesh.vertices)):
             corr = (smoothed[i] - drift[i]) * strength
@@ -1054,17 +1224,27 @@ def generate_shape_preservation(
             if drift_len > 1e-8 and corr_len > drift_len * 0.75:
                 corr *= (drift_len * 0.75) / max(corr_len, 1e-12)
 
-            live.data[i].co = basis.data[i].co + corr
+            corrections.append(corr)
 
             ln = float(corr.length)
             if ln > 1e-12:
                 changed += 1
                 max_delta_world = max(max_delta_world, float((mw3 @ corr).length))
-
-        live.value = 1.0
-        return changed, max_delta_world
     finally:
+        # Free the evaluated mesh before probing below (probing re-evaluates the scene).
         obj_eval.to_mesh_clear()
+
+    # Measured on the posed garment, but the shape key is applied before the Armature: convert back.
+    corrections, unconvertible = to_rest_space(corrections, rest_space_deformation(garment_obj, depsgraph))
+
+    live = ensure_live_preserve_shapekey(garment_obj)
+    basis = garment_obj.data.shape_keys.key_blocks[0]
+    # The measured drift already includes the live key at its current value; add on top of it.
+    already_applied = shape_key_offsets(live, basis)
+    for i, corr in enumerate(corrections):
+        live.data[i].co = basis.data[i].co + already_applied[i] + corr
+    live.value = 1.0
+    return changed, max_delta_world, unconvertible
 
 
 def ensure_body_mask_modifier(body_obj: bpy.types.Object) -> bpy.types.MaskModifier:
@@ -1074,6 +1254,89 @@ def ensure_body_mask_modifier(body_obj: bpy.types.Object) -> bpy.types.MaskModif
     mod.vertex_group = CG_VG_BODY_MASK
     mod.invert_vertex_group = True
     return mod
+
+
+# Geometry Nodes push-out needs "Sample Nearest Surface" (added in Blender 3.4); older versions use Displace.
+ANTICLIP_GN_MIN_VERSION = (3, 4, 0)
+
+# Modifiers cannot store custom properties (Displace never could, Geometry Nodes not since Blender 5.2),
+# so the anti-clip strength base lives on the garment object.
+CG_PROP_ANTICLIP_STRENGTH_BASE = "cg_anticlip_strength_base"
+
+
+def _ensure_group_socket(ng: bpy.types.NodeTree, in_out: str, socket_type: str, name: str) -> None:
+    """Create a node-group input/output socket if missing (Blender 4.0 moved them to ng.interface)."""
+    if bpy.app.version >= (4, 0, 0):
+        for item in ng.interface.items_tree:
+            if item.item_type == "SOCKET" and item.in_out == in_out and item.name == name:
+                return
+        ng.interface.new_socket(name=name, in_out=in_out, socket_type=socket_type)
+        return
+    sockets = ng.inputs if in_out == "INPUT" else ng.outputs
+    if sockets.find(name) < 0:
+        sockets.new(socket_type, name)
+
+
+def node_group_input_identifier(ng: bpy.types.NodeTree, name: str) -> str | None:
+    """
+    Identifier of a node-group input, which is how a Geometry Nodes modifier names its value.
+
+    Never build it by hand ("Input_2" in 3.x, "Socket_2" in 4.x): ask the socket for its identifier.
+    To read/write the modifier value use set_gn_modifier_input() / gn_modifier_input().
+    """
+    if bpy.app.version >= (4, 0, 0):
+        for item in ng.interface.items_tree:
+            if item.item_type == "SOCKET" and item.in_out == "INPUT" and item.name == name:
+                return item.identifier
+        return None
+    sock = ng.inputs.get(name)
+    return sock.identifier if sock is not None else None
+
+
+# Blender 5.2 replaced mod["Socket_N"] with mod.properties.inputs.Socket_N.value on Geometry Nodes
+# modifiers (and modifiers no longer accept custom properties at all).
+GN_INPUTS_VIA_PROPERTIES = bpy.app.version >= (5, 2, 0)
+
+
+def gn_modifier_input(mod: bpy.types.Modifier, name: str) -> tuple | None:
+    """
+    (owner, property path) of a Geometry Nodes modifier input, so that on every Blender version:
+    owner.keyframe_insert(path) keyframes it and owner.path_from_id(path) is its F-Curve data path.
+    """
+    key = node_group_input_identifier(mod.node_group, name)
+    if key is None:
+        return None
+    if GN_INPUTS_VIA_PROPERTIES:
+        return getattr(mod.properties.inputs, key), "value"
+    return mod, f'["{key}"]'
+
+
+def set_gn_modifier_input(mod: bpy.types.Modifier, name: str, value) -> None:
+    key = node_group_input_identifier(mod.node_group, name)
+    if key is None:
+        return
+    if GN_INPUTS_VIA_PROPERTIES:
+        getattr(mod.properties.inputs, key).value = value
+    else:
+        mod[key] = value
+
+
+def _enabled_socket(sockets, name: str):
+    # Some nodes have one hidden socket per data type with the same name; use the enabled one.
+    for s in sockets:
+        if s.name == name and s.enabled:
+            return s
+    raise KeyError(f"Node socket '{name}' not found")
+
+
+def anticlip_strength_base(garment_obj: bpy.types.Object, mod: bpy.types.Modifier, default: float) -> float:
+    """The push distance (m) that Factor = 1.0 corresponds to."""
+    if CG_PROP_ANTICLIP_STRENGTH_BASE in garment_obj:
+        return float(garment_obj[CG_PROP_ANTICLIP_STRENGTH_BASE])
+    # Files made by older add-on versions stored it on the Geometry Nodes modifier.
+    if mod is not None and mod.type == "NODES" and not GN_INPUTS_VIA_PROPERTIES:
+        return float(mod.get("cg_strength_base", default))
+    return float(default)
 
 
 def ensure_anticlip_modifiers(
@@ -1104,50 +1367,64 @@ def ensure_anticlip_modifiers(
             ng = bpy.data.node_groups.new(name=name, type="GeometryNodeTree")
 
         # Ensure Group IO sockets exist (keep stable names for animation/keyframing).
-        def _ensure_in(sock_type: str, sock_name: str):
-            if ng.inputs.find(sock_name) < 0:
-                ng.inputs.new(sock_type, sock_name)
-
-        def _ensure_out(sock_type: str, sock_name: str):
-            if ng.outputs.find(sock_name) < 0:
-                ng.outputs.new(sock_type, sock_name)
-
-        _ensure_in("NodeSocketGeometry", "Geometry")
-        _ensure_in("NodeSocketObject", "Body")
-        _ensure_in("NodeSocketFloat", "Offset")
-        _ensure_in("NodeSocketFloat", "Strength")
-        _ensure_in("NodeSocketFloat", "Max Push")
-        _ensure_in("NodeSocketFloat", "Factor")
-        _ensure_out("NodeSocketGeometry", "Geometry")
+        _ensure_group_socket(ng, "INPUT", "NodeSocketGeometry", "Geometry")
+        _ensure_group_socket(ng, "INPUT", "NodeSocketObject", "Body")
+        _ensure_group_socket(ng, "INPUT", "NodeSocketFloat", "Offset")
+        _ensure_group_socket(ng, "INPUT", "NodeSocketFloat", "Strength")
+        _ensure_group_socket(ng, "INPUT", "NodeSocketFloat", "Max Push")
+        _ensure_group_socket(ng, "INPUT", "NodeSocketFloat", "Factor")
+        _ensure_group_socket(ng, "INPUT", "NodeSocketFloat", "Normal Sign")
+        _ensure_group_socket(ng, "OUTPUT", "NodeSocketGeometry", "Geometry")
+        if bpy.app.version >= (4, 0, 0):
+            ng.is_modifier = True
 
         nodes = ng.nodes
         links = ng.links
         nodes.clear()
 
         n_in = nodes.new("NodeGroupInput")
-        n_in.location = (-800, 0)
+        n_in.location = (-1000, 0)
         n_out = nodes.new("NodeGroupOutput")
-        n_out.location = (600, 0)
+        n_out.location = (900, 0)
 
         n_obj = nodes.new("GeometryNodeObjectInfo")
-        n_obj.location = (-600, 200)
+        n_obj.location = (-800, 300)
         n_obj.transform_space = "RELATIVE"
 
+        # Nearest point on the body surface.
         n_prox = nodes.new("GeometryNodeProximity")
-        n_prox.location = (-350, 200)
+        n_prox.location = (-550, 350)
         n_prox.target_element = "FACES"
 
-        n_pos = nodes.new("GeometryNodeInputPosition")
-        n_pos.location = (-600, 0)
+        # Body normal at that nearest point.
+        n_normal = nodes.new("GeometryNodeInputNormal")
+        n_normal.location = (-800, 100)
+        n_sample = nodes.new("GeometryNodeSampleNearestSurface")
+        n_sample.location = (-550, 150)
+        n_sample.data_type = "FLOAT_VECTOR"
 
+        n_pos = nodes.new("GeometryNodeInputPosition")
+        n_pos.location = (-800, -50)
+
+        # outward = normalize(body normal * Normal Sign)   (Normal Sign = -1 for an inside-out body)
+        n_flip = nodes.new("ShaderNodeVectorMath")
+        n_flip.location = (-350, 150)
+        n_flip.operation = "SCALE"
+
+        n_outward = nodes.new("ShaderNodeVectorMath")
+        n_outward.location = (-150, 150)
+        n_outward.operation = "NORMALIZE"
+
+        # signed = (position - nearest) . outward   (+ outside the body, - inside)
         n_sub = nodes.new("ShaderNodeVectorMath")
-        n_sub.location = (-150, 50)
+        n_sub.location = (-350, 300)
         n_sub.operation = "SUBTRACT"
 
-        n_norm = nodes.new("ShaderNodeVectorMath")
-        n_norm.location = (0, 50)
-        n_norm.operation = "NORMALIZE"
+        n_dot = nodes.new("ShaderNodeVectorMath")
+        n_dot.location = (-150, 300)
+        n_dot.operation = "DOT_PRODUCT"
 
+        # push = max(0, Offset - signed): a vertex 2 cm inside with a 1 cm offset is pushed 3 cm out.
         n_off_minus = nodes.new("ShaderNodeMath")
         n_off_minus.location = (-150, -150)
         n_off_minus.operation = "SUBTRACT"
@@ -1230,24 +1507,31 @@ def ensure_anticlip_modifiers(
         n_mul_scale2.operation = "MULTIPLY"
 
         n_set = nodes.new("GeometryNodeSetPosition")
-        n_set.location = (400, 50)
+        n_set.location = (700, 50)
 
         n_scale_vec = nodes.new("ShaderNodeVectorMath")
-        n_scale_vec.location = (250, 50)
+        n_scale_vec.location = (550, 50)
         n_scale_vec.operation = "SCALE"
 
         # Wiring
         links.new(n_in.outputs["Body"], n_obj.inputs["Object"])
-        links.new(n_obj.outputs["Geometry"], n_prox.inputs["Target Geometry"])
-        links.new(n_in.outputs["Geometry"], n_prox.inputs["Geometry"])
+        # Input 0 is the target geometry on every version ("Target" in 3.x, "Geometry" in 4.x).
+        links.new(n_obj.outputs["Geometry"], n_prox.inputs[0])
+        links.new(n_obj.outputs["Geometry"], n_sample.inputs["Mesh"])
+        links.new(n_normal.outputs["Normal"], _enabled_socket(n_sample.inputs, "Value"))
         links.new(n_in.outputs["Geometry"], n_set.inputs["Geometry"])
+
+        links.new(_enabled_socket(n_sample.outputs, "Value"), n_flip.inputs[0])
+        links.new(n_in.outputs["Normal Sign"], n_flip.inputs["Scale"])
+        links.new(n_flip.outputs["Vector"], n_outward.inputs[0])
 
         links.new(n_pos.outputs["Position"], n_sub.inputs[0])
         links.new(n_prox.outputs["Position"], n_sub.inputs[1])
-        links.new(n_sub.outputs["Vector"], n_norm.inputs[0])
+        links.new(n_sub.outputs["Vector"], n_dot.inputs[0])
+        links.new(n_outward.outputs["Vector"], n_dot.inputs[1])
 
         links.new(n_in.outputs["Offset"], n_off_minus.inputs[0])
-        links.new(n_prox.outputs["Distance"], n_off_minus.inputs[1])
+        links.new(n_dot.outputs["Value"], n_off_minus.inputs[1])
         links.new(n_off_minus.outputs["Value"], n_clamp0.inputs[0])
         links.new(n_clamp0.outputs["Value"], n_mul_strength.inputs[0])
         links.new(n_in.outputs["Strength"], n_mul_strength.inputs[1])
@@ -1269,8 +1553,8 @@ def ensure_anticlip_modifiers(
         links.new(n_mul_scale1.outputs["Value"], n_mul_scale2.inputs[0])
         links.new(n_attr_clip.outputs["Attribute"], n_mul_scale2.inputs[1])
 
-        # Combine direction with magnitude and scale.
-        links.new(n_norm.outputs["Vector"], n_scale_vec.inputs["Vector"])
+        # Combine the outward direction with magnitude and scale.
+        links.new(n_outward.outputs["Vector"], n_scale_vec.inputs[0])
         links.new(n_min_maxpush.outputs["Value"], n_mul_mag.inputs[0])
         links.new(n_mul_scale2.outputs["Value"], n_mul_mag.inputs[1])
         links.new(n_mul_mag.outputs["Value"], n_scale_vec.inputs["Scale"])
@@ -1279,60 +1563,55 @@ def ensure_anticlip_modifiers(
         links.new(n_set.outputs["Geometry"], n_out.inputs["Geometry"])
         return ng
 
+    def _rename_legacy(mod) -> None:
+        # Preserve an incompatible existing modifier without deleting user data.
+        mod.name = f"{CG_MOD_ANTICLIP}_Legacy"
+        mod.show_viewport = False
+        mod.show_render = False
+
     mod_ac = garment_obj.modifiers.get(CG_MOD_ANTICLIP)
     if mod_ac is not None and mod_ac.type not in {"NODES", "DISPLACE"}:
-        # Preserve any existing legacy modifier without deleting user data.
-        try:
-            mod_ac.name = f"{CG_MOD_ANTICLIP}_Legacy"
-            mod_ac.show_viewport = False
-            mod_ac.show_render = False
-        except Exception:
-            pass
+        _rename_legacy(mod_ac)
         mod_ac = None
 
-    # Prefer Geometry Nodes (push direction based on nearest body point, not garment normals).
-    try:
+    if bpy.app.version >= ANTICLIP_GN_MIN_VERSION:
+        # Geometry Nodes push-out along the body's outward normal (not the garment normals).
         ng = _ensure_anticlip_node_group()
         if mod_ac is not None and mod_ac.type != "NODES":
-            try:
-                mod_ac.name = f"{CG_MOD_ANTICLIP}_Legacy"
-                mod_ac.show_viewport = False
-                mod_ac.show_render = False
-            except Exception:
-                pass
+            _rename_legacy(mod_ac)
             mod_ac = None
         if mod_ac is None:
             mod_ac = garment_obj.modifiers.new(name=CG_MOD_ANTICLIP, type="NODES")
         mod_ac.node_group = ng
 
         def _set_input(socket_name: str, value):
-            idx = ng.inputs.find(socket_name)
-            if idx < 0:
-                return
-            key = f"Input_{idx+1}"
-            mod_ac[key] = value
+            set_gn_modifier_input(mod_ac, socket_name, value)
+
+        body_mesh = body_obj.data
+        body_mesh.calc_loop_triangles()
+        normal_sign = _body_normal_sign(
+            [v.co for v in body_mesh.vertices], [tuple(lt.vertices) for lt in body_mesh.loop_triangles]
+        )
 
         _set_input("Body", body_obj)
         _set_input("Offset", float(offset_distance))
         _set_input("Strength", float(strength))
         _set_input("Max Push", float(max_push_distance if max_push_distance > 0.0 else offset_distance))
         _set_input("Factor", 1.0)
-        mod_ac["cg_strength_base"] = float(offset_distance)
-    except Exception:
-        # Fallback: Displace (depends on garment normals; less robust, but topology-safe).
+        _set_input("Normal Sign", float(normal_sign))
+        garment_obj[CG_PROP_ANTICLIP_STRENGTH_BASE] = float(offset_distance)
+    else:
+        # Blender < 3.4 fallback: Displace (depends on garment normals; less robust, but topology-safe).
         if mod_ac is not None and mod_ac.type != "DISPLACE":
+            _rename_legacy(mod_ac)
             mod_ac = None
         if mod_ac is None:
             mod_ac = garment_obj.modifiers.new(name=CG_MOD_ANTICLIP, type="DISPLACE")
-        if hasattr(mod_ac, "direction"):
-            mod_ac.direction = "NORMAL"
-        if hasattr(mod_ac, "mid_level"):
-            mod_ac.mid_level = 0.0
-        if hasattr(mod_ac, "vertex_group"):
-            mod_ac.vertex_group = CG_VG_CLIPPING
-        if hasattr(mod_ac, "strength"):
-            mod_ac["cg_strength_base"] = float(offset_distance)
-            mod_ac.strength = float(offset_distance)
+        mod_ac.direction = "NORMAL"
+        mod_ac.mid_level = 0.0
+        mod_ac.vertex_group = CG_VG_CLIPPING
+        garment_obj[CG_PROP_ANTICLIP_STRENGTH_BASE] = float(offset_distance)
+        mod_ac.strength = float(offset_distance)
 
     mod_sm = garment_obj.modifiers.get(CG_MOD_SMOOTH)
     if str(mode) != "SAFE_PUSHOUT" and smooth_iterations > 0 and smooth_strength > 0.0:

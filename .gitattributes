@@ -1,0 +1,2 @@
+# Keep development-only files out of GitHub's "Download ZIP" (git archive), so the add-on ZIP stays clean.
+tests/ export-ignore

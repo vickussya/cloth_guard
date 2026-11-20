@@ -36,6 +36,10 @@ from .utils import (
     CG_SHAPEKEY_REST,
     CG_SHAPEKEY_LIVE_PRESERVE,
     add_shapekey_driver_rotation_range,
+    anticlip_strength_base,
+    bake_live_key_into,
+    gn_modifier_input,
+    set_gn_modifier_input,
     build_bvh,
     clear_vertex_group,
     correct_current_pose,
@@ -186,6 +190,23 @@ def _bind_corrective_smooth(context, *, obj: bpy.types.Object, modifier_name: st
         return False
 
 
+def _find_fcurve(anim_data, data_path: str):
+    """
+    Return the F-Curve animating data_path in anim_data's action, or None.
+
+    Blender 4.4 moved F-Curves into per-slot "channelbags" (layered actions) and Blender 5.0
+    removed the old Action.fcurves shortcut, so newer versions must go through the slot.
+    """
+    if anim_data is None or anim_data.action is None:
+        return None
+    if bpy.app.version >= (4, 4, 0):
+        from bpy_extras import anim_utils
+
+        channelbag = anim_utils.action_get_channelbag_for_slot(anim_data.action, anim_data.action_slot)
+        return channelbag.fcurves.find(data_path) if channelbag is not None else None
+    return anim_data.action.fcurves.find(data_path=data_path)
+
+
 def _get_or_create_anticlip_mod(garment_obj: bpy.types.Object) -> bpy.types.Modifier | None:
     mod = garment_obj.modifiers.get(CG_MOD_ANTICLIP)
     if mod is None:
@@ -200,21 +221,20 @@ def _keyframe_modifier_strength(*, garment_obj: bpy.types.Object, mod_name: str,
 
     # Geometry Nodes: keyframe the "Factor" input (0..1) when available.
     if getattr(mod, "type", "") == "NODES" and getattr(mod, "node_group", None) is not None:
-        ng = mod.node_group
-        idx = ng.inputs.find("Factor")
-        if idx < 0:
+        ref = gn_modifier_input(mod, "Factor")
+        if ref is None:
             return
-        key = f"Input_{idx+1}"
-        mod[key] = float(value)
+        owner, prop_path = ref
+        set_gn_modifier_input(mod, "Factor", float(value))
         try:
-            mod.keyframe_insert(data_path=f'[\"{key}\"]', frame=int(frame))
+            owner.keyframe_insert(data_path=prop_path, frame=int(frame))
         except Exception:
             return
         ad = garment_obj.animation_data
         if ad is None or ad.action is None:
             return
-        data_path = f'modifiers[\"{mod.name}\"][\"{key}\"]'
-        fc = ad.action.fcurves.find(data_path=data_path)
+        data_path = owner.path_from_id(prop_path)
+        fc = _find_fcurve(ad, data_path)
         if fc is None:
             return
         for kp in fc.keyframe_points:
@@ -225,11 +245,7 @@ def _keyframe_modifier_strength(*, garment_obj: bpy.types.Object, mod_name: str,
     # Displace / others: keyframe strength scaled by base.
     if not hasattr(mod, "strength"):
         return
-    base = 1.0
-    try:
-        base = float(mod.get("cg_strength_base", 1.0))
-    except Exception:
-        base = 1.0
+    base = anticlip_strength_base(garment_obj, mod, 1.0)
     mod.strength = float(value) * float(base)
     try:
         mod.keyframe_insert(data_path="strength", frame=int(frame))
@@ -240,7 +256,7 @@ def _keyframe_modifier_strength(*, garment_obj: bpy.types.Object, mod_name: str,
     if ad is None or ad.action is None:
         return
     data_path = f'modifiers["{mod.name}"].strength'
-    fc = ad.action.fcurves.find(data_path=data_path)
+    fc = _find_fcurve(ad, data_path)
     if fc is None:
         return
     for kp in fc.keyframe_points:
@@ -289,6 +305,11 @@ def _run_detection_and_weights(
             detection_radius=detection_radius,
             use_risk_area=settings.use_risk_area,
         )
+    if mods:
+        # The modifiers are switched back on, but the scene still holds the cage result until it is
+        # re-evaluated. Without this, the next _topology_mismatch() check saw "no mismatch" and the
+        # helper/modifier mode was never chosen.
+        context.view_layer.update()
 
     contact_affected = write_weights_to_vertex_group(garment_obj, CG_VG_CONTACT, det.contact_weights)
     clipping_affected = write_weights_to_vertex_group(garment_obj, CG_VG_CLIPPING, det.clipping_weights)
@@ -299,6 +320,24 @@ def _topology_mismatch(*, garment_obj: bpy.types.Object, depsgraph) -> bool:
     return _base_vertex_count(garment_obj) != _eval_vertex_count(garment_obj, depsgraph)
 
 
+def _warn_unconvertible(report_to: Operator | None, garment_obj: bpy.types.Object, frame: int, count: int, what: str) -> None:
+    """
+    Tell the artist when some pushes could not be converted back through the rig (degenerate deformation).
+
+    Those vertices keep the push as measured on the posed garment, which can point the wrong way once
+    the Armature re-poses it, so the artist must check that frame.
+    """
+    if report_to is None or count <= 0:
+        return
+    report_to.report(
+        {"WARNING"},
+        f"{garment_obj.name}, frame {frame}: {count} vertices could not be converted back through the rig, "
+        f"so their {what} may point the wrong way. Next: go to frame {frame} and check them. If they look wrong, "
+        "look for a bone scaled to 0 or a modifier between the shape keys and the Armature that flattens the "
+        "garment (e.g. Shrinkwrap), fix it and run the button again.",
+    )
+
+
 def _run_shape_key_passes(
     *,
     context,
@@ -306,10 +345,12 @@ def _run_shape_key_passes(
     garment_obj: bpy.types.Object,
     body_obj: bpy.types.Object,
     depsgraph,
+    report_to: Operator | None = None,
 ) -> tuple[object, object, int]:
     """
     Run multi-pass shape-key correction.
 
+    report_to: operator that receives the "could not convert through the rig" warning.
     Returns: (det_before, det_after, passes_used)
     """
     passes = int(getattr(settings, "correction_passes", 1))
@@ -348,87 +389,94 @@ def _run_shape_key_passes(
             return True
         return False
 
-    def _snapshot_keyblock(kb) -> list:
-        return [p.co.copy() for p in kb.data]
+    def _snapshot_keyblock(kb) -> tuple[list, float]:
+        return [p.co.copy() for p in kb.data], float(kb.value)
 
-    def _restore_keyblock(kb, snap: list) -> None:
-        if len(kb.data) != len(snap):
+    def _restore_keyblock(kb, snap: tuple[list, float]) -> None:
+        coords, value = snap
+        if len(kb.data) != len(coords):
             return
-        for i in range(len(snap)):
-            kb.data[i].co = snap[i]
+        for i in range(len(coords)):
+            kb.data[i].co = coords[i]
+        kb.value = value
 
     live_kb = ensure_live_correction_shapekey(garment_obj)
     # Track best accepted detection so we never keep a worse result.
     det_best = det_before
+    # Pushed vertices the rig deformation could not be undone for (largest count over accepted passes).
+    unconvertible = 0
 
-    for p in range(passes):
-        # Verification-based correction: never keep a correction that makes clipping worse.
-        attempt_strength = float(strength)
-        accepted = False
-        det_after = det_best
-        stats = None
+    try:
+        for p in range(passes):
+            # Verification-based correction: never keep a correction that makes clipping worse.
+            attempt_strength = float(strength)
+            accepted = False
+            det_after = det_best
+            stats = None
 
-        snap = _snapshot_keyblock(live_kb)
-        for attempt in range(4):
-            stats = correct_current_pose(
-                garment_obj=garment_obj,
-                body_obj=body_obj,
-                depsgraph=depsgraph,
-                offset_distance=target_offset,
-                detection_radius=max(target_offset, settings.detection_radius),
-                correction_strength=attempt_strength,
-                max_push_distance=settings.max_push_distance,
-                smooth_iterations=smooth_it,
-                smooth_strength=smooth_st,
-                use_risk_area=settings.use_risk_area,
-                preserve_pinned_areas=settings.preserve_pinned_areas,
-                accumulate=(p > 0),
-            )
+            snap = _snapshot_keyblock(live_kb)
+            for attempt in range(4):
+                stats = correct_current_pose(
+                    garment_obj=garment_obj,
+                    body_obj=body_obj,
+                    depsgraph=depsgraph,
+                    offset_distance=target_offset,
+                    detection_radius=max(target_offset, settings.detection_radius),
+                    correction_strength=attempt_strength,
+                    max_push_distance=settings.max_push_distance,
+                    smooth_iterations=smooth_it,
+                    smooth_strength=smooth_st,
+                    use_risk_area=settings.use_risk_area,
+                    preserve_pinned_areas=settings.preserve_pinned_areas,
+                )
 
-            context.view_layer.update()
-            depsgraph = context.evaluated_depsgraph_get()
-
-            det_after, _, _ = _run_detection_and_weights(
-                context=context,
-                settings=settings,
-                garment_obj=garment_obj,
-                body_obj=body_obj,
-                depsgraph=depsgraph,
-                offset_distance=target_offset,
-                detection_radius=max(target_offset, settings.detection_radius),
-            )
-
-            if _is_worse(det_best, det_after):
-                _restore_keyblock(live_kb, snap)
                 context.view_layer.update()
                 depsgraph = context.evaluated_depsgraph_get()
-                attempt_strength *= 0.5
-                continue
 
-            accepted = True
-            det_best = det_after
-            break
+                det_after, _, _ = _run_detection_and_weights(
+                    context=context,
+                    settings=settings,
+                    garment_obj=garment_obj,
+                    body_obj=body_obj,
+                    depsgraph=depsgraph,
+                    offset_distance=target_offset,
+                    detection_radius=max(target_offset, settings.detection_radius),
+                )
 
-        print(
-            "[Cloth Guard][Pass]",
-            garment_obj.name,
-            f"pass={p+1}/{passes}",
-            f"before={int(det_before.stats.flagged_clipping)}",
-            f"after={int(det_after.stats.flagged_clipping)}",
-            f"accepted={'YES' if accepted else 'NO'}",
-            (f"changed={getattr(stats, 'changed_verts', 0)}" if stats is not None else "changed=0"),
-            (f"max_delta={getattr(stats, 'max_delta_distance', 0.0):.6f} m" if stats is not None else "max_delta=0.000000 m"),
-            (f"pen_before={float(det_before.stats.max_penetration or 0.0):.6f} m" if hasattr(det_before.stats, "max_penetration") else ""),
-            (f"pen_after={float(det_after.stats.max_penetration or 0.0):.6f} m" if hasattr(det_after.stats, "max_penetration") else ""),
-        )
+                if _is_worse(det_best, det_after):
+                    _restore_keyblock(live_kb, snap)
+                    context.view_layer.update()
+                    depsgraph = context.evaluated_depsgraph_get()
+                    attempt_strength *= 0.5
+                    continue
 
-        if not accepted:
-            # Rejected: stop early; we refuse to keep a worse correction.
-            return det_before, det_best, p
-        if int(det_best.stats.flagged_clipping) <= 0:
-            return det_before, det_best, p + 1
+                accepted = True
+                det_best = det_after
+                unconvertible = max(unconvertible, int(stats.unconvertible_verts))
+                break
 
-    return det_before, det_best, passes
+            print(
+                "[Cloth Guard][Pass]",
+                garment_obj.name,
+                f"pass={p+1}/{passes}",
+                f"before={int(det_before.stats.flagged_clipping)}",
+                f"after={int(det_after.stats.flagged_clipping)}",
+                f"accepted={'YES' if accepted else 'NO'}",
+                (f"changed={getattr(stats, 'changed_verts', 0)}" if stats is not None else "changed=0"),
+                (f"max_delta={getattr(stats, 'max_delta_distance', 0.0):.6f} m" if stats is not None else "max_delta=0.000000 m"),
+                (f"pen_before={float(det_before.stats.max_penetration or 0.0):.6f} m" if hasattr(det_before.stats, "max_penetration") else ""),
+                (f"pen_after={float(det_after.stats.max_penetration or 0.0):.6f} m" if hasattr(det_after.stats, "max_penetration") else ""),
+            )
+
+            if not accepted:
+                # Rejected: stop early; we refuse to keep a worse correction.
+                return det_before, det_best, p
+            if int(det_best.stats.flagged_clipping) <= 0:
+                return det_before, det_best, p + 1
+
+        return det_before, det_best, passes
+    finally:
+        _warn_unconvertible(report_to, garment_obj, context.scene.frame_current, unconvertible, "anti-clip push")
 
 
 class CG_OT_check_garment_compatibility(Operator):
@@ -570,12 +618,10 @@ def _set_anticlip_helper_factor(*, garment_obj: bpy.types.Object, value: float) 
     if mod is None:
         return
     if getattr(mod, "type", "") == "NODES" and getattr(mod, "node_group", None) is not None:
-        idx = mod.node_group.inputs.find("Factor")
-        if idx >= 0:
-            mod[f"Input_{idx+1}"] = float(value)
+        set_gn_modifier_input(mod, "Factor", float(value))
         return
     if hasattr(mod, "strength"):
-        base = float(mod.get("cg_strength_base", 1.0))
+        base = anticlip_strength_base(garment_obj, mod, 1.0)
         mod.strength = float(value) * base
 
 
@@ -1157,7 +1203,7 @@ class CG_OT_generate_shape_preservation_current(Operator):
                         continue
 
                     ensure_live_preserve_shapekey(garment_obj)
-                    changed, max_d = generate_shape_preservation(
+                    changed, max_d, unconvertible = generate_shape_preservation(
                         garment_obj=garment_obj,
                         depsgraph=depsgraph,
                         strength=settings.shape_strength,
@@ -1169,6 +1215,7 @@ class CG_OT_generate_shape_preservation_current(Operator):
                         protect_borders=settings.protect_borders,
                         protect_groups=settings.protect_preserve_groups,
                     )
+                    _warn_unconvertible(self, garment_obj, context.scene.frame_current, unconvertible, "shape preservation")
                     if changed <= 0:
                         zero_delta += 1
                         self.report(
@@ -1264,7 +1311,7 @@ class CG_OT_generate_shape_preservation_flagged(Operator):
                                 continue
 
                             ensure_live_preserve_shapekey(garment_obj)
-                            changed, max_d = generate_shape_preservation(
+                            changed, max_d, unconvertible = generate_shape_preservation(
                                 garment_obj=garment_obj,
                                 depsgraph=depsgraph,
                                 strength=settings.shape_strength,
@@ -1276,26 +1323,15 @@ class CG_OT_generate_shape_preservation_flagged(Operator):
                                 protect_borders=settings.protect_borders,
                                 protect_groups=settings.protect_preserve_groups,
                             )
+                            _warn_unconvertible(self, garment_obj, context.scene.frame_current, unconvertible, "shape preservation")
                             if changed <= 0:
                                 continue
 
                             view_layer.objects.active = garment_obj
                             key_name = f"CG_Preserve_{frame:04d}"
-                            preserve_kb = garment_obj.data.shape_keys.key_blocks.get(CG_SHAPEKEY_LIVE_PRESERVE)
-                            if preserve_kb is not None:
-                                preserve_kb.value = 1.0
-                            tmp = garment_obj.shape_key_add(name="CG__TMP_PRESERVE_BAKE", from_mix=True)
-                            try:
-                                target = garment_obj.data.shape_keys.key_blocks.get(key_name)
-                                if target is None:
-                                    tmp.name = key_name
-                                else:
-                                    for i in range(len(tmp.data)):
-                                        target.data[i].co = tmp.data[i].co
-                            finally:
-                                kb = garment_obj.data.shape_keys.key_blocks.get("CG__TMP_PRESERVE_BAKE")
-                                if kb is not None:
-                                    garment_obj.shape_key_remove(key_block=kb)
+                            # Move only the CG_LivePreserve offset into the frame key and empty the live key,
+                            # so the preservation is applied once.
+                            bake_live_key_into(garment_obj, CG_SHAPEKEY_LIVE_PRESERVE, key_name)
 
                             _keyframe_shapekey_value(garment_obj=garment_obj, key_name=key_name, frame=frame - 1, value=0.0)
                             _keyframe_shapekey_value(garment_obj=garment_obj, key_name=key_name, frame=frame, value=1.0)
@@ -1637,11 +1673,9 @@ class CG_OT_correct_current_pose(Operator):
                             max_w = float(max(det.clipping_weights)) if getattr(det, "clipping_weights", None) else 0.0
                         except Exception:
                             max_w = 0.0
-                        base = 0.0
-                        try:
-                            base = float(mod.get("cg_strength_base", target_offset)) if mod is not None else float(target_offset)
-                        except Exception:
-                            base = float(target_offset)
+                        base = anticlip_strength_base(
+                            garment_obj, garment_obj.modifiers.get(CG_MOD_ANTICLIP), float(target_offset)
+                        )
                         approx_max_delta = base * max_w
                         protect_txt = "ON" if bool(settings.preserve_pinned_areas) else "OFF"
                         accept_txt = "ACCEPTED" if accepted_factor > 0.0 else "REJECTED"
@@ -1663,6 +1697,7 @@ class CG_OT_correct_current_pose(Operator):
                         garment_obj=garment_obj,
                         body_obj=body_obj,
                         depsgraph=depsgraph,
+                        report_to=self,
                     )
                     after_clipping = int(det_after.stats.flagged_clipping)
                     changed_live, max_live = _shapekey_delta_stats(garment_obj=garment_obj, shapekey_name=CG_SHAPEKEY_LIVE)
@@ -1868,33 +1903,15 @@ class CG_OT_go_to_problem_frame(Operator):
 
 def _bake_live_correction_to_key(garment_obj: bpy.types.Object, name: str) -> None:
     """
-    Bake the current mixed shape (including CG_LiveCorrection) into a named shape key.
+    Move the CG_LiveCorrection offset into a named per-frame shape key and empty the live key.
 
-    If a key with the same name exists, it is overwritten (data copied).
+    (It used to copy the whole visible mix and leave the live key on, so the correction was
+    applied twice, and any active user shape key was baked in a second time.)
     """
     if garment_obj.type != "MESH":
         raise RuntimeError("Garment is not a mesh")
-
-    ensure_live_correction_shapekey(garment_obj).value = 1.0
-    if garment_obj.data.shape_keys is None:
-        garment_obj.shape_key_add(name="Basis", from_mix=False)
-
-    keys = garment_obj.data.shape_keys
-    target = keys.key_blocks.get(name)
-
-    tmp = garment_obj.shape_key_add(name="CG__TMP_BAKE", from_mix=True)
-    try:
-        if target is None:
-            tmp.name = name
-            return
-        if len(tmp.data) != len(target.data):
-            raise RuntimeError("Shape key vertex count mismatch")
-        for i in range(len(tmp.data)):
-            target.data[i].co = tmp.data[i].co
-    finally:
-        kb = keys.key_blocks.get("CG__TMP_BAKE")
-        if kb is not None:
-            garment_obj.shape_key_remove(key_block=kb)
+    ensure_live_correction_shapekey(garment_obj)
+    bake_live_key_into(garment_obj, CG_SHAPEKEY_LIVE, name)
 
 
 def _keyframe_shapekey_value(*, garment_obj: bpy.types.Object, key_name: str, frame: int, value: float) -> None:
@@ -1909,7 +1926,7 @@ def _keyframe_shapekey_value(*, garment_obj: bpy.types.Object, key_name: str, fr
     if ad is None or ad.action is None:
         return
     data_path = f'key_blocks["{kb.name}"].value'
-    fc = ad.action.fcurves.find(data_path=data_path)
+    fc = _find_fcurve(ad, data_path)
     if fc is None:
         return
     for kp in fc.keyframe_points:
@@ -1931,7 +1948,7 @@ def _keyframe_modifier_factor(*, garment_obj: bpy.types.Object, mod_name: str, f
     if ad is None or ad.action is None:
         return
     data_path = f'modifiers["{mod.name}"].factor'
-    fc = ad.action.fcurves.find(data_path=data_path)
+    fc = _find_fcurve(ad, data_path)
     if fc is None:
         return
     for kp in fc.keyframe_points:
@@ -2017,6 +2034,7 @@ class CG_OT_generate_correction_current_frame(Operator):
                         garment_obj=garment_obj,
                         body_obj=body_obj,
                         depsgraph=depsgraph,
+                        report_to=self,
                     )
                     changed_live, max_live = _shapekey_delta_stats(garment_obj=garment_obj, shapekey_name=CG_SHAPEKEY_LIVE)
                     if changed_live <= 0 or max_live <= 1e-12:
@@ -2138,6 +2156,7 @@ class CG_OT_generate_corrections_flagged_frames(Operator):
                                 garment_obj=garment_obj,
                                 body_obj=body_obj,
                                 depsgraph=depsgraph,
+                                report_to=self,
                             )
                             changed_live, max_live = _shapekey_delta_stats(garment_obj=garment_obj, shapekey_name=CG_SHAPEKEY_LIVE)
                             if changed_live <= 0 or max_live <= 1e-12:
@@ -2209,6 +2228,9 @@ class CG_OT_refresh_live_correction(Operator):
                 except Exception as e:
                     self.report({"WARNING"}, f"{garment_obj.name}: {e}")
                     continue
+                _warn_unconvertible(
+                    self, garment_obj, context.scene.frame_current, stats.unconvertible_verts, "anti-clip push"
+                )
                 total_corrected += stats.corrected_verts
                 if stats.min_nearest_distance is not None:
                     global_min = (
@@ -2261,6 +2283,7 @@ class CG_OT_create_corrective_shapekey(Operator):
                 garment_obj=garment_obj,
                 body_obj=settings.body_object,
                 depsgraph=depsgraph,
+                report_to=self,
             )
             changed_live, max_live = _shapekey_delta_stats(garment_obj=garment_obj, shapekey_name=CG_SHAPEKEY_LIVE)
             if changed_live <= 0 or max_live <= 1e-12:
@@ -2278,10 +2301,13 @@ class CG_OT_create_corrective_shapekey(Operator):
         garment_obj.select_set(True)
 
         try:
+            # Start from a copy of Basis (Blender adds ".001" if the name is taken), then move the
+            # live correction into it. The live key is emptied so the correction is not applied twice.
             new_key = garment_obj.shape_key_add(
                 name=(settings.corrective_name.strip() or "CG_Corrective"),
-                from_mix=True,
+                from_mix=False,
             )
+            bake_live_key_into(garment_obj, CG_SHAPEKEY_LIVE, new_key.name)
         except Exception as e:
             self.report({"ERROR"}, f"Failed to bake corrective shape key: {e}")
             return {"CANCELLED"}

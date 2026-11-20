@@ -32,6 +32,13 @@ from bpy.types import Collection
 from .utils import cg_update_modifier_visibility
 
 
+def _update_live_anti_clip(self, context) -> None:
+    # Must be a named module-level function, not a lambda: with `from __future__ import annotations`
+    # Blender evaluates the property definition as a string, and a lambda created there cannot see
+    # this module's imports (NameError every time the checkbox is clicked).
+    cg_update_modifier_visibility(context)
+
+
 def _poll_mesh_object(self, obj: Object | None) -> bool:
     return obj is not None and obj.type == "MESH"
 
@@ -167,7 +174,7 @@ class CG_Settings(PropertyGroup):
         name="Enable Live Anti-Clip",
         description="Enable/disable Cloth Guard's live correction shape key on garments (refresh as needed)",
         default=False,
-        update=lambda self, context: cg_update_modifier_visibility(context),
+        update=_update_live_anti_clip,
     )
 
     offset_distance: FloatProperty(
